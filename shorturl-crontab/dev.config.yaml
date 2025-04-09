@@ -1,0 +1,13 @@
+redis:
+  host: "192.168.88.133"
+  port: 6379
+  pwd: "123456"
+mysql:
+  dsn: "root:123456@tcp(localhost:3306)/mediahub?collation=utf8mb4_unicode_ci&charset=utf8mb4"
+  maxLifeTime: 3600
+  maxOpenConn: 10
+  maxIdleConn: 10
+log:
+  level: "info"
+  logPath: "runtime/logs/app.log"
+

@@ -1,0 +1,20 @@
+syntax = "proto3";
+option go_package = "shorturl/proto";
+package shorturl.chenaws.com;
+
+message Url {
+  string url = 1;
+  int64 userID = 2;
+  bool isPublic = 3;
+}
+
+message ShortKey {
+  string key = 1;
+  int64 userID = 2;
+  bool isPublic = 3;
+}
+
+service ShortUrl {
+  rpc GetShortUrl(Url) returns (Url);
+  rpc GetOriginalUrl(ShortKey) returns (Url);
+}
