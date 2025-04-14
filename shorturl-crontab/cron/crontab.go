@@ -17,6 +17,7 @@ const DefaultUrlMapTTL = 30 * 86400 // 默认URL映射缓存有效期30天（单
 func Run() {
 	setUrlMapID() // 初始化时立即执行一次
 	c := cron.New()
+	// (min hour day month year)
 	c.AddFunc("0 3 * * *", setUrlMapID) // 每日3点执行定时任务
 	c.Run()
 }

@@ -28,13 +28,16 @@ type IUrlMapData interface {
 	Update(e UrlMapEntity) error
 
 	// GetByID 通过ID查询URL映射记录
-	GetByID(id int64) (UrlMapEntity, error)
+	GetByID(id int64) (*UrlMapEntity, error)
 
 	// GetByOriginal 通过原始URL查询映射记录
 	GetByOriginal(originalUrl string) (UrlMapEntity, error)
 
 	// IncrementTimes 增加指定记录的访问次数
 	IncrementTimes(id int64, incrementTimes int, now int64) error
+	
+	// GetTopUrls 获取访问次数最多的前N个URL映射记录
+	GetTopUrls(limit int) ([]UrlMapEntity, error)
 }
 
 type urlMapData struct {
@@ -104,7 +107,7 @@ func (d *urlMapData) Update(e UrlMapEntity) error {
 // 返回：
 //   - 查询到的实体对象（未找到时各字段为零值）
 //   - 错误信息（数据库操作失败时）
-func (d *urlMapData) GetByID(id int64) (UrlMapEntity, error) {
+func (d *urlMapData) GetByID(id int64) (*UrlMapEntity, error) {
 	sqlStr := fmt.Sprintf("select original_url from %s where id = ?", d.tableName)
 	row := d.db.QueryRow(sqlStr, id)
 	entity := UrlMapEntity{}
@@ -113,12 +116,12 @@ func (d *urlMapData) GetByID(id int64) (UrlMapEntity, error) {
 	// 特殊处理未找到的情况
 	if err != nil && errors.Is(err, sql.ErrNoRows) {
 		d.log.Error(zerror.NewByErr(err))
-		return entity, err
+		return &entity, err
 	}
 	if originalUrl.Valid {
 		entity.OriginalUrl = originalUrl.String
 	}
-	return entity, nil
+	return &entity, nil
 }
 
 // GetByOriginal 通过原始URL查询映射记录
@@ -161,4 +164,39 @@ func (d *urlMapData) IncrementTimes(id int64, incrementTimes int, now int64) err
 		return err
 	}
 	return nil
+}
+
+// GetTopUrls 获取访问次数最多的前N个URL映射记录
+// 参数：
+//   - limit: 需要获取的记录数量
+//
+// 返回：
+//   - 访问次数最多的URL映射记录列表
+//   - 错误信息（数据库操作失败时）
+func (d *urlMapData) GetTopUrls(limit int) ([]UrlMapEntity, error) {
+	sqlStr := fmt.Sprintf("SELECT id, user_id, short_key, original_url, times, create_at, update_at FROM %s ORDER BY times DESC LIMIT ?", d.tableName)
+	rows, err := d.db.Query(sqlStr, limit)
+	if err != nil {
+		d.log.Error(zerror.NewByErr(err))
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []UrlMapEntity
+	for rows.Next() {
+		var entity UrlMapEntity
+		err := rows.Scan(&entity.ID, &entity.UserID, &entity.ShortKey, &entity.OriginalUrl, &entity.Times, &entity.CreateAt, &entity.UpdateAt)
+		if err != nil {
+			d.log.Error(zerror.NewByErr(err))
+			return nil, err
+		}
+		results = append(results, entity)
+	}
+
+	if err = rows.Err(); err != nil {
+		d.log.Error(zerror.NewByErr(err))
+		return nil, err
+	}
+
+	return results, nil
 }

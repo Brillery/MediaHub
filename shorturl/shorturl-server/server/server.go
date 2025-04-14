@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"shorturl/pkg/config"
 	"shorturl/pkg/constants"
 	"shorturl/pkg/log"
@@ -22,16 +23,52 @@ type shortUrlService struct {
 	log               log.ILogger    // 日志记录器
 	urlMapDataFactory data.IUrlMapDataFactory
 	kvCacheFactory    cache.CacheFactory
+	lockFactory       cache.DistributedLockFactory
+	bloomFactory      cache.BloomFilterFactory
+	bloomFilter       cache.BloomFilter
+	userBloomFilter   cache.BloomFilter
+	cacheWarmer       cache.CacheWarmer
 }
 
-// NewService 创建并返回一个新的 shortUrlService 实例。
-func NewService(cnf *config.Config, log log.ILogger, urlMapDataFactory data.IUrlMapDataFactory, kvCacheFactory cache.CacheFactory) proto.ShortUrlServer {
-	return &shortUrlService{
+// NewService 创建一个新的短链接服务实例
+func NewService(cnf *config.Config, logger log.ILogger, urlDataFactory data.IUrlMapDataFactory, kvCacheFactory cache.CacheFactory, lockFactory cache.DistributedLockFactory, bloomFactory cache.BloomFilterFactory) proto.ShortUrlServer {
+	// 创建缓存预热器
+	kvCache := kvCacheFactory.NewKVCache()
+	bloomFilter := bloomFactory.NewBloomFilter("shorturl:bloom", 100000, 0.01)
+	userBloomFilter := bloomFactory.NewBloomFilter("shorturl:user:bloom", 100000, 0.01)
+
+	// 创建缓存预热器
+	cacheWarmer := cache.NewShortUrlCacheWarmer(logger, kvCache, urlDataFactory, bloomFilter)
+
+	// 创建服务实例
+	service := &shortUrlService{
 		config:            cnf,
-		log:               log,
-		urlMapDataFactory: urlMapDataFactory,
+		log:               logger,
+		urlMapDataFactory: urlDataFactory,
 		kvCacheFactory:    kvCacheFactory,
+		lockFactory:       lockFactory,
+		bloomFactory:      bloomFactory,
+		bloomFilter:       bloomFilter,
+		userBloomFilter:   userBloomFilter,
+		cacheWarmer:       cacheWarmer,
 	}
+
+	// 启动缓存预热
+	service.startCacheWarmup()
+
+	return service
+}
+
+// startCacheWarmup 启动缓存预热
+func (s *shortUrlService) startCacheWarmup() {
+	// 立即预热一次
+	ctx := context.Background()
+	if err := s.cacheWarmer.Warmup(ctx); err != nil {
+		s.log.Error(err)
+	}
+
+	// 每6小时预热一次
+	s.cacheWarmer.StartPeriodicWarmup(ctx, 6*time.Hour)
 }
 
 // GetShortUrl 根据原始URL生成或获取短链接
@@ -101,11 +138,25 @@ func (s *shortUrlService) GetShortUrl(ctx context.Context, in *proto.Url) (*prot
 	kvCache := s.kvCacheFactory.NewKVCache()
 	defer kvCache.Destroy()
 	key := keyPrefix + entity.ShortKey
-	err = kvCache.Set(key, entity.OriginalUrl, cache.DefaultTTL)
+
+	// 使用随机过期时间，避免缓存雪崩
+	ttl := cache.DefaultTTL*80/100 + rand.Intn(cache.DefaultTTL*40/100)
+	err = kvCache.Set(key, entity.OriginalUrl, ttl)
 	if err != nil {
 		s.log.Error(zerror.NewByErr(err))
 		return nil, err
 	}
+
+	// 将短链接ID添加到布隆过滤器
+	if s.bloomFilter != nil {
+		if !isPublic {
+
+			s.userBloomFilter.Add("", strconv.FormatInt(entity.ID, 10))
+		} else {
+			s.bloomFilter.Add("", strconv.FormatInt(entity.ID, 10))
+		}
+	}
+
 	return &proto.Url{
 		Url:    domain + entity.ShortKey,
 		UserID: in.UserID,
@@ -169,7 +220,32 @@ func (s *shortUrlService) GetOriginalUrl(ctx context.Context, in *proto.ShortKey
 
 	// 如果缓存未命中，从数据库获取原始URL
 	if originalUrl == "" {
-		fmt.Println(id)
+		// 使用布隆过滤器检查短链接ID是否存在
+		if s.bloomFilter != nil {
+			if !isPublic {
+
+				exists, err := s.userBloomFilter.Exists("", strconv.FormatInt(id, 10))
+				if err != nil {
+					s.log.Warning("布隆过滤器检查失败: " + err.Error())
+				} else if !exists {
+					// 布隆过滤器判断短链接不存在，直接返回错误
+					err := zerror.NewByMsg("短链不存在")
+					s.log.Error(err)
+					return nil, err
+				}
+			} else {
+				exists, err := s.bloomFilter.Exists("", strconv.FormatInt(id, 10))
+				if err != nil {
+					s.log.Warning("布隆过滤器检查失败: " + err.Error())
+				} else if !exists {
+					// 布隆过滤器判断短链接不存在，直接返回错误
+					err := zerror.NewByMsg("短链不存在")
+					s.log.Error(err)
+					return nil, err
+				}
+			}
+		}
+
 		// 缓存穿透过滤
 		err = s.idFilter(id, kvCache, isPublic)
 		if err != nil {
@@ -177,19 +253,86 @@ func (s *shortUrlService) GetOriginalUrl(ctx context.Context, in *proto.ShortKey
 			return nil, err
 		}
 
-		entity, err := d.GetByID(id)
+		// 使用分布式锁防止缓存击穿
+		lockKey := "lock:" + key
+		lock := s.lockFactory.NewDistributedLock()
+		locked, err := lock.Lock(lockKey, 5*time.Second)
 		if err != nil {
-			s.log.Error(err)
-			return nil, zerror.NewByErr(err)
-		}
-		originalUrl = entity.OriginalUrl
-	}
+			s.log.Warning("获取分布式锁失败: " + err.Error())
+		} else if locked {
+			defer lock.Unlock(lockKey)
 
-	// 将原始URL写入缓存
-	err = kvCache.Set(key, originalUrl, cache.DefaultTTL)
-	if err != nil {
-		s.log.Error(err)
-		return nil, zerror.NewByErr(err)
+			// 再次检查缓存，可能在获取锁的过程中其他请求已经更新了缓存
+			originalUrl, err = kvCache.Get(key)
+			if err != nil {
+				s.log.Error(err)
+				return nil, zerror.NewByErr(err)
+			}
+
+			if originalUrl == "" {
+				// 从数据库获取原始URL
+				entity, err := d.GetByID(id)
+				if err != nil {
+					s.log.Error(err)
+					return nil, zerror.NewByErr(err)
+				}
+
+				if entity == nil {
+					// 数据库中也找不到，缓存空值防止缓存穿透
+					originalUrl = ""
+					// 使用较短的过期时间缓存空值
+					err = kvCache.Set(key, "", 60)
+					if err != nil {
+						s.log.Warning("缓存空值失败: " + err.Error())
+					}
+				} else {
+					originalUrl = entity.OriginalUrl
+					// 使用随机过期时间，避免缓存雪崩
+					ttl := cache.DefaultTTL*80/100 + rand.Intn(cache.DefaultTTL*40/100)
+					err = kvCache.Set(key, originalUrl, ttl)
+					if err != nil {
+						s.log.Error(err)
+						return nil, zerror.NewByErr(err)
+					}
+				}
+			}
+		} else {
+			// 未能获取锁，等待一段时间后重试
+			time.Sleep(100 * time.Millisecond)
+			originalUrl, err = kvCache.Get(key)
+			if err != nil {
+				s.log.Error(err)
+				return nil, zerror.NewByErr(err)
+			}
+
+			if originalUrl == "" {
+				// 仍然未命中，从数据库获取
+				entity, err := d.GetByID(id)
+				if err != nil {
+					s.log.Error(err)
+					return nil, zerror.NewByErr(err)
+				}
+
+				if entity == nil {
+					// 数据库中也找不到，缓存空值防止缓存穿透
+					originalUrl = ""
+					// 使用较短的过期时间缓存空值
+					err = kvCache.Set(key, "", 60)
+					if err != nil {
+						s.log.Warning("缓存空值失败: " + err.Error())
+					}
+				} else {
+					originalUrl = entity.OriginalUrl
+					// 使用随机过期时间，避免缓存雪崩
+					ttl := cache.DefaultTTL*80/100 + rand.Intn(cache.DefaultTTL*40/100)
+					err = kvCache.Set(key, originalUrl, ttl)
+					if err != nil {
+						s.log.Error(err)
+						return nil, zerror.NewByErr(err)
+					}
+				}
+			}
+		}
 	}
 
 	// 增加短链接访问次数（错误时仅记录日志不影响返回）

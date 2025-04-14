@@ -48,8 +48,22 @@ func main() {
 
 	// 初始化Redis连接池
 	redis.InitRedisPool(cnf)
+	redisPool := redis.GetPool()
+	
 	// 创建基于Redis的键值缓存工厂
-	kvCacheFactory := cache.NewRedisCacheFactory(redis.GetPool())
+	redisCacheFactory := cache.NewRedisCacheFactory(redisPool)
+	
+	// 创建分布式锁工厂
+	lockFactory := cache.NewRedisDistributedLockFactory(redisPool)
+	
+	// 创建布隆过滤器工厂
+	bloomFactory := cache.NewRedisBloomFilterFactory(redisPool)
+	
+	// 创建本地缓存
+	localCache := cache.NewMemoryCache()
+	
+	// 创建两级缓存工厂
+	kvCacheFactory := cache.NewTwoLevelCacheFactory(localCache, redisCacheFactory, lockFactory)
 
 	// 绑定并监听指定的网络地址和端口
 	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cnf.Server.IP, cnf.Server.Port))
@@ -59,7 +73,7 @@ func main() {
 
 	// 创建gRPC服务器实例并注册ShortUrl服务
 	s := grpc.NewServer(grpc.UnaryInterceptor(interceptor.UnaryAuthInterceptor), grpc.StreamInterceptor(interceptor.StreamAuthInterceptor))
-	service := server.NewService(cnf, logger, urlMapDataFactory, kvCacheFactory)
+	service := server.NewService(cnf, logger, urlMapDataFactory, kvCacheFactory, lockFactory, bloomFactory)
 	proto.RegisterShortUrlServer(s, service)
 
 	// 多路复用健康检查
