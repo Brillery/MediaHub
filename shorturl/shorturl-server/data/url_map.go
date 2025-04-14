@@ -174,7 +174,7 @@ func (d *urlMapData) IncrementTimes(id int64, incrementTimes int, now int64) err
 //   - 访问次数最多的URL映射记录列表
 //   - 错误信息（数据库操作失败时）
 func (d *urlMapData) GetTopUrls(limit int) ([]UrlMapEntity, error) {
-	sqlStr := fmt.Sprintf("SELECT id, user_id, short_key, original_url, times, create_at, update_at FROM %s ORDER BY times DESC LIMIT ?", d.tableName)
+	sqlStr := fmt.Sprintf("SELECT id, short_key, original_url, times, create_at, update_at FROM %s ORDER BY times DESC LIMIT ?", d.tableName)
 	rows, err := d.db.Query(sqlStr, limit)
 	if err != nil {
 		d.log.Error(zerror.NewByErr(err))
@@ -185,7 +185,7 @@ func (d *urlMapData) GetTopUrls(limit int) ([]UrlMapEntity, error) {
 	var results []UrlMapEntity
 	for rows.Next() {
 		var entity UrlMapEntity
-		err := rows.Scan(&entity.ID, &entity.UserID, &entity.ShortKey, &entity.OriginalUrl, &entity.Times, &entity.CreateAt, &entity.UpdateAt)
+		err := rows.Scan(&entity.ID, &entity.ShortKey, &entity.OriginalUrl, &entity.Times, &entity.CreateAt, &entity.UpdateAt)
 		if err != nil {
 			d.log.Error(zerror.NewByErr(err))
 			return nil, err
