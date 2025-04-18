@@ -1,9 +1,9 @@
 package grpc_client_pool
 
 import (
-	"enterprise-project1-mediahub/mediahub/pkg/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"log"
 	"sync"
 )
 
@@ -12,37 +12,126 @@ type ClientPool interface {
 	Put(conn *grpc.ClientConn)
 }
 
-type clientPool struct {
-	pool sync.Pool
+type clientCusPool struct {
+	mutex      sync.Mutex
+	conns      []*grpc.ClientConn
+	maxConnNum int
+	target     string
+	opts       []grpc.DialOption
+	currIndex  int
 }
 
-func NewPool(target string, opts ...grpc.DialOption) (ClientPool, error) {
-	return &clientPool{
-		pool: sync.Pool{
-			New: func() any {
-				conn, err := grpc.Dial(target, opts...)
-				if err != nil {
-					log.Error(err)
-					return nil
-				}
-				return conn
-			},
-		},
+func NewClientCusPool(target string, maxConnNum int, opts ...grpc.DialOption) (ClientPool, error) {
+	if maxConnNum <= 0 {
+		maxConnNum = 1
+	}
+	return &clientCusPool{
+		mutex:      sync.Mutex{},
+		conns:      make([]*grpc.ClientConn, maxConnNum),
+		maxConnNum: maxConnNum,
+		target:     target,
+		opts:       opts,
+		currIndex:  0,
 	}, nil
 }
 
-func (c *clientPool) Get() *grpc.ClientConn {
-	conn := c.pool.Get().(*grpc.ClientConn)
-	if conn.GetState() == connectivity.Shutdown || conn.GetState() == connectivity.TransientFailure {
-		conn = c.pool.Get().(*grpc.ClientConn) // 为什么要类型推断，因为pool源码里返回的是一个any类型
+func (c *clientCusPool) new() *grpc.ClientConn {
+	conn, err := grpc.Dial(c.target, c.opts...)
+	if err != nil {
+		log.Println(err)
+		return nil
+	}
+	return conn
+}
+func (c *clientCusPool) Get() *grpc.ClientConn {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.currIndex += 1
+	if c.currIndex >= c.maxConnNum {
+		c.currIndex = 0
+	}
+	conn := c.conns[c.currIndex]
+	if conn == nil || conn.GetState() == connectivity.Shutdown || conn.GetState() == connectivity.TransientFailure {
+		if conn != nil {
+			conn.Close()
+		}
+		conn = c.new()
+		c.conns[c.currIndex] = conn
 	}
 	return conn
 }
 
-func (c *clientPool) Put(conn *grpc.ClientConn) {
+func (c *clientCusPool) Put(conn *grpc.ClientConn) {
 	if conn.GetState() == connectivity.Shutdown || conn.GetState() == connectivity.TransientFailure {
 		conn.Close()
-		return
 	}
-	c.pool.Put(conn)
 }
+
+// package grpc_client_pool
+//
+//import (
+//	"google.golang.org/grpc"
+//	"google.golang.org/grpc/connectivity"
+//	"log"
+//	"sync"
+//)
+//
+//type ClientPool interface {
+//	Get() *grpc.ClientConn
+//	Put(conn *grpc.ClientConn)
+//}
+//
+//type clientCusPool struct {
+//	mutex      sync.Mutex
+//	conns      []*grpc.ClientConn
+//	maxConnNum int
+//	target     string
+//	opts       []grpc.DialOption
+//	currIndex  int
+//}
+//
+//func NewClientCusPool(target string, maxConnNum int, opts ...grpc.DialOption) (ClientPool, error) {
+//	if maxConnNum <= 0 {
+//		maxConnNum = 1
+//	}
+//	return &clientCusPool{
+//		mutex:      sync.Mutex{},
+//		conns:      make([]*grpc.ClientConn, maxConnNum),
+//		maxConnNum: maxConnNum,
+//		target:     target,
+//		opts:       opts,
+//		currIndex:  0,
+//	}, nil
+//}
+//
+//func (c *clientCusPool) new() *grpc.ClientConn {
+//	conn, err := grpc.Dial(c.target, c.opts...)
+//	if err != nil {
+//		log.Println(err)
+//		return nil
+//	}
+//	return conn
+//}
+//func (c *clientCusPool) Get() *grpc.ClientConn {
+//	c.mutex.Lock()
+//	defer c.mutex.Unlock()
+//	c.currIndex += 1
+//	if c.currIndex >= c.maxConnNum {
+//		c.currIndex = 0
+//	}
+//	conn := c.conns[c.currIndex]
+//	if conn == nil || conn.GetState() == connectivity.Shutdown || conn.GetState() == connectivity.TransientFailure {
+//		if conn != nil {
+//			conn.Close()
+//		}
+//		conn = c.new()
+//		c.conns[c.currIndex] = conn
+//	}
+//	return conn
+//}
+//
+//func (c *clientCusPool) Put(conn *grpc.ClientConn) {
+//	if conn.GetState() == connectivity.Shutdown || conn.GetState() == connectivity.TransientFailure {
+//		conn.Close()
+//	}
+//}
