@@ -1,3 +1,11 @@
+// Package shorturl 负责把 mediahub 上传链路接入内部 shorturl gRPC 服务。
+//
+// 模块职责：
+// - 输入：全局配置中的 shorturl 地址和访问令牌。
+// - 输出：全局复用的 gRPC 客户端连接池，供上传控制器创建短链。
+// - 状态边界：只维护当前进程内的连接池单例，不缓存短链业务数据。
+// - 外部依赖：grpc_client_pool、gRPC insecure transport、配置中心和日志模块。
+// - 非职责：不负责短链生成、短链鉴权、上传文件校验或 HTTP 响应处理。
 package shorturl
 
 import (
@@ -29,8 +37,8 @@ func NewShortUrlClientPool() grpc_client_pool.ClientPool {
 	once.Do(func() {
 		// 获取配置信息
 		cnf := config.GetConfig()
-		// 初始化 gRPC 客户端连接池
-		pool, err = grpc_client_pool.NewPool(cnf.DependOn.ShortUrl.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		// mediahub 主服务使用固定容量连接池，避免上传高峰时每个请求重复 Dial。
+		pool, err = grpc_client_pool.NewClientCusPool(cnf.DependOn.ShortUrl.Address, 4, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		// 如果初始化过程中出现错误，记录错误日志
 		if err != nil {
 			log.Error(zerror.NewByErr(err))

@@ -1,3 +1,7 @@
+// Package middleware 提供 mediahub HTTP 服务的通用 Gin 中间件。
+//
+// Auth 中间件负责把前端携带的 SSO token 交给用户中心校验，并把可信用户信息写入
+// Gin Context。业务控制器只能读取这里写入的上下文值，不能信任前端表单里的 userId。
 package middleware
 
 import (
@@ -69,7 +73,7 @@ func checkAuth(token string) (*userInfo, error) {
 		return nil, err
 	}
 
-	log.Info("Response body: %s", string(body))
+	log.InfoF("Response body: %s", string(body))
 
 	contentType := res.Header.Get("Content-Type")
 	if !strings.Contains(contentType, "application/json") {
