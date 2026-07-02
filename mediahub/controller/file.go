@@ -1,9 +1,15 @@
+// Package controller 承载 mediahub HTTP API 的业务控制器。
+//
+// 文件上传控制器负责把前端提交的图片资源保存到对象存储，并向 shorturl 服务申请短链。
+// 输入是 Gin 请求上下文中的鉴权用户和 multipart file；输出是短链 URL。
+// 本模块只维护单次请求内的校验和编排状态，不持久化文件元数据、不维护短链缓存，也不负责用户中心鉴权。
 package controller
 
 import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"enterprise-project1-mediahub/mediahub/middleware"
 	"enterprise-project1-mediahub/mediahub/pkg/config"
 	"enterprise-project1-mediahub/mediahub/pkg/log"
 	"enterprise-project1-mediahub/mediahub/pkg/storage"
@@ -11,6 +17,7 @@ import (
 	"enterprise-project1-mediahub/mediahub/services"
 	"enterprise-project1-mediahub/mediahub/services/shorturl"
 	"enterprise-project1-mediahub/mediahub/services/shorturl/proto"
+	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	_ "golang.org/x/image/webp"
@@ -38,6 +45,15 @@ type Controller struct {
 	config *config.Config
 }
 
+const (
+	// MaxUploadBytes 是单个图片文件允许的最大字节数。
+	// 该限制必须在服务端执行，前端提示只能改善体验，不能作为安全边界。
+	MaxUploadBytes = 20 << 20
+	// maxMultipartOverheadBytes 给 multipart 边界和表单字段预留空间。
+	// 请求体总限制略大于文件限制，避免合法文件因为 multipart 元数据被误杀。
+	maxMultipartOverheadBytes = 1 << 20
+)
+
 func NewController(sf storage.StorageFactory, logger log.ILogger, cnf *config.Config) *Controller {
 	return &Controller{
 		sf:     sf,
@@ -47,26 +63,39 @@ func NewController(sf storage.StorageFactory, logger log.ILogger, cnf *config.Co
 }
 
 func (c *Controller) Upload(ctx *gin.Context) {
-	userId := ctx.GetInt64("user_id")
-	userName := ctx.PostForm("user_name") // 自动从form表单获取数据
-	//ctx.Request.FormValue()	FormValue 会先从查询参数（URL 中的 ?key=value）中查找键，如果找不到再从表单数据中查找。
-	// 它可以处理 GET 和 POST 请求中的表单数据和查询参数。
-	// 如果没有找到对应的键，返回空字符串 ""。
+	// 用户 ID 只能来自鉴权中间件写入的上下文；前端表单中的同名字段不可信。
+	userId := ctx.GetInt64(middleware.AuthUserIDKey)
+	// 必须在任何 PostForm/FormFile 调用前设置请求体上限：
+	// Gin 读取 multipart 时会触发整体解析，顺序错了会绕过服务端大小限制。
+	ctx.Request.Body = http.MaxBytesReader(ctx.Writer, ctx.Request.Body, MaxUploadBytes+maxMultipartOverheadBytes)
 	fileHeader, err := ctx.FormFile("file")
 	if err != nil {
 		c.log.Error(zerror.NewByErr(err))
+		if isRequestBodyTooLarge(err) {
+			ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{
+				"error": "仅支持上传20M以内的图片",
+			})
+			return
+		}
 		ctx.JSON(http.StatusBadRequest, gin.H{
 			"error": "formFile",
 		})
 		return
 	}
+	userName := ctx.PostForm("user_name") // 自动从已解析的 form 表单获取展示用用户名。
+	if fileHeader.Size > MaxUploadBytes {
+		ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error": "仅支持上传20M以内的图片",
+		})
+		return
+	}
 	file, err := fileHeader.Open()
-	defer file.Close()
 	if err != nil {
 		c.log.Error(zerror.NewByErr(err))
 		ctx.JSON(http.StatusInternalServerError, gin.H{})
 		return
 	}
+	defer file.Close()
 
 	/*
 			io.Reader 代表一次性可读的数据流，数据被读取后，指针会前进，已经读取过的部分不会再保留。
@@ -101,12 +130,12 @@ func (c *Controller) Upload(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{
 			"error": "仅支持jpg、png、gif格式",
 		})
+		return
 	}
 	// bytes.NewReader(content) 生成的是 io.Reader，它没有 Close() 方法。
 	// io.NopCloser(...) 将 io.Reader 包装成 io.ReadCloser，这样 isImage 如果接收 io.ReadCloser，也能正常使用。
 
 	md5Digest := calMD5Digest(content)
-	fmt.Printf("%x\n", md5Digest)
 	filename := fmt.Sprintf("%x%s", md5Digest, path.Ext(fileHeader.Filename))
 	filePath := "/public/" + filename
 	if userId != 0 {
@@ -187,11 +216,16 @@ func (c *Controller) Upload(ctx *gin.Context) {
 //}
 
 func IsImage(r io.Reader) bool {
-	_, _, err := image.Decode(r)
+	_, format, err := image.DecodeConfig(r)
 	if err != nil {
 		return false
 	}
-	return true
+	switch format {
+	case "jpeg", "png", "gif", "webp":
+		return true
+	default:
+		return false
+	}
 }
 
 func calMD5Digest(msg []byte) []byte {
@@ -199,4 +233,9 @@ func calMD5Digest(msg []byte) []byte {
 	m.Write(msg)
 	bs := m.Sum(nil)
 	return bs
+}
+
+func isRequestBodyTooLarge(err error) bool {
+	var maxBytesErr *http.MaxBytesError
+	return errors.As(err, &maxBytesErr)
 }

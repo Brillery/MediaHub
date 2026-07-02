@@ -16,6 +16,16 @@ import (
 	"strings"
 )
 
+const (
+	// AuthUserIDKey 是鉴权中间件写入 Gin Context 的登录用户 ID。
+	// 控制器只能读取该 key，避免信任前端表单里的 user_id。
+	AuthUserIDKey = "user_id"
+	// AuthUserNameKey 是用户中心返回的用户昵称，主要用于响应展示或日志。
+	AuthUserNameKey = "user_name"
+	// AuthUserAvatarURLKey 是用户头像地址，只作为展示字段，不参与权限判断。
+	AuthUserAvatarURLKey = "avatar_url"
+)
+
 func Auth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := strings.TrimPrefix(c.Request.Header.Get("Authorization"), "Bearer ")
@@ -33,9 +43,9 @@ func Auth() gin.HandlerFunc {
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
-		c.Set("User.ID", user.ID)
-		c.Set("User.Name", user.Name)
-		c.Set("User.AvatarUrl", user.AvatarUrl)
+		c.Set(AuthUserIDKey, user.ID)
+		c.Set(AuthUserNameKey, user.Name)
+		c.Set(AuthUserAvatarURLKey, user.AvatarUrl)
 		c.Next()
 	}
 }
