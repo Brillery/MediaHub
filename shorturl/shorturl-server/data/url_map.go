@@ -1,3 +1,11 @@
+// Package data 封装 shorturl 服务对 URL 映射表的数据库访问。
+//
+// 模块职责：
+// - 输入：短链 ID、原始 URL、用户 ID 和访问次数增量。
+// - 输出：URL 映射实体或明确的未命中结果。
+// - 状态边界：只读写 MySQL 表，不维护 Redis 缓存、布隆过滤器或分布式锁。
+// - 外部依赖：database/sql 与调用方传入的表名；表名只能来自内部常量工厂，不能接收用户输入。
+// - 并发边界：数据库自增 ID 负责生成唯一记录；同 URL 幂等仍需上层通过唯一约束或 upsert 收敛。
 package data
 
 import (
@@ -35,7 +43,7 @@ type IUrlMapData interface {
 
 	// IncrementTimes 增加指定记录的访问次数
 	IncrementTimes(id int64, incrementTimes int, now int64) error
-	
+
 	// GetTopUrls 获取访问次数最多的前N个URL映射记录
 	GetTopUrls(limit int) ([]UrlMapEntity, error)
 }
@@ -100,23 +108,28 @@ func (d *urlMapData) Update(e UrlMapEntity) error {
 	return nil
 }
 
-// GetByID 通过ID查询URL映射记录
+// GetByID 通过ID查询URL映射记录。
+//
+// 未命中不是数据库异常，而是短链访问链路的正常分支：
+// 上层需要拿到 nil entity 后写入短期空值缓存，避免不存在的 key 反复打到 MySQL。
 // 参数：
 //   - id: 记录ID
 //
 // 返回：
-//   - 查询到的实体对象（未找到时各字段为零值）
-//   - 错误信息（数据库操作失败时）
+//   - 查询到的实体对象；未找到时返回 nil
+//   - 错误信息；仅数据库异常时返回
 func (d *urlMapData) GetByID(id int64) (*UrlMapEntity, error) {
 	sqlStr := fmt.Sprintf("select original_url from %s where id = ?", d.tableName)
 	row := d.db.QueryRow(sqlStr, id)
 	entity := UrlMapEntity{}
 	var originalUrl sql.NullString
 	err := row.Scan(&originalUrl)
-	// 特殊处理未找到的情况
-	if err != nil && errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
 		d.log.Error(zerror.NewByErr(err))
-		return &entity, err
+		return nil, err
 	}
 	if originalUrl.Valid {
 		entity.OriginalUrl = originalUrl.String

@@ -16,3 +16,9 @@ func TestToBase62(t *testing.T) {
 		}
 	}
 }
+
+func TestToBase10RejectsInvalidCharacters(t *testing.T) {
+	if got := ToBase10("!"); got != 0 {
+		t.Fatalf("ToBase10 invalid key = %d, want 0", got)
+	}
+}
