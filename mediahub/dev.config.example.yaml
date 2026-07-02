@@ -1,0 +1,27 @@
+http:
+  ip: "0.0.0.0"
+  port: 8080
+  mode: "debug"
+mysql:
+  dsn: "mediahub_user:mediahub_password@tcp(localhost:3306)/mediahub?charset=utf8mb4&parseTime=True&loc=Local"
+  maxLifeTime: 3600
+  maxOpenConn: 10
+  maxIdleConn: 10
+redis:
+  host: "localhost"
+  port: 6379
+  pwd: ""
+log:
+  level: "info"
+  logPath: "runtime/logs/app.log"
+cos:
+  secretId: "replace-with-cos-secret-id"
+  secretKey: "replace-with-cos-secret-key"
+  bucketUrl: "https://example-1250000000.cos.ap-guangzhou.myqcloud.com"
+  cdnDomain: "https://img.example.com"
+dependOn:
+  shortUrl:
+    address: "localhost:50051"
+    accessToken: "replace-with-internal-shorturl-token"
+  user:
+    address: "http://localhost:8081"
