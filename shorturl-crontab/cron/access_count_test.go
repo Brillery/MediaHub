@@ -21,10 +21,21 @@ func TestFlushAccessCountsPreservesConcurrentIncrements(t *testing.T) {
 	data := &fakeAccessCountData{}
 	now := int64(1710000000)
 
-	if err := flushAccessCountsWithDeps(ctx, cache, data, []string{tableName}, now); err != nil {
+	stats, err := flushAccessCountsWithDeps(ctx, cache, data, []string{tableName}, now)
+	if err != nil {
 		t.Fatalf("flushAccessCountsWithDeps error = %v, want nil", err)
 	}
 
+	if !stats.LockAcquired {
+		t.Fatal("LockAcquired = false, want true")
+	}
+	if len(stats.Tables) != 1 {
+		t.Fatalf("table stats = %d, want 1", len(stats.Tables))
+	}
+	tableStats := stats.Tables[0]
+	if tableStats.TableName != tableName || tableStats.ScannedEntries != 1 || tableStats.FlushedRows != 1 || tableStats.FlushedCount != 5 {
+		t.Fatalf("table stats = %#v, want one flushed snapshot count 5", tableStats)
+	}
 	if len(data.writes) != 1 {
 		t.Fatalf("writes = %d, want 1", len(data.writes))
 	}
@@ -38,6 +49,12 @@ func TestFlushAccessCountsPreservesConcurrentIncrements(t *testing.T) {
 	if cache.unlockCalls != 1 {
 		t.Fatalf("unlock calls = %d, want 1", cache.unlockCalls)
 	}
+	if cache.lockToken == "" {
+		t.Fatal("lock token is empty, want generated owner token")
+	}
+	if cache.unlockToken != cache.lockToken {
+		t.Fatalf("unlock token = %q, want lock token %q", cache.unlockToken, cache.lockToken)
+	}
 }
 
 func TestFlushAccessCountsKeepsRedisCountWhenDatabaseFails(t *testing.T) {
@@ -49,10 +66,17 @@ func TestFlushAccessCountsKeepsRedisCountWhenDatabaseFails(t *testing.T) {
 	cache.hashes[key]["456"] = 7
 	data := &fakeAccessCountData{err: errors.New("mysql unavailable")}
 
-	if err := flushAccessCountsWithDeps(ctx, cache, data, []string{tableName}, 1710000001); err == nil {
+	stats, err := flushAccessCountsWithDeps(ctx, cache, data, []string{tableName}, 1710000001)
+	if err == nil {
 		t.Fatal("flushAccessCountsWithDeps error = nil, want database error")
 	}
 
+	if !stats.LockAcquired {
+		t.Fatal("LockAcquired = false, want true")
+	}
+	if len(stats.Tables) != 1 || stats.Tables[0].ScannedEntries != 1 || stats.Tables[0].FlushedRows != 0 {
+		t.Fatalf("table stats = %#v, want scanned entry without successful flush", stats.Tables)
+	}
 	if got := cache.hashes[key]["456"]; got != 7 {
 		t.Fatalf("redis count after db error = %d, want unchanged 7", got)
 	}
@@ -67,10 +91,17 @@ func TestFlushAccessCountsSkipsWhenLockNotAcquired(t *testing.T) {
 	cache.hashes[key]["789"] = 3
 	data := &fakeAccessCountData{}
 
-	if err := flushAccessCountsWithDeps(ctx, cache, data, []string{tableName}, 1710000002); err != nil {
+	stats, err := flushAccessCountsWithDeps(ctx, cache, data, []string{tableName}, 1710000002)
+	if err != nil {
 		t.Fatalf("flushAccessCountsWithDeps error = %v, want nil when another instance owns lock", err)
 	}
 
+	if stats.LockAcquired {
+		t.Fatal("LockAcquired = true, want false when another instance owns lock")
+	}
+	if len(stats.Tables) != 0 {
+		t.Fatalf("table stats = %d, want 0 when lock is not acquired", len(stats.Tables))
+	}
 	if len(data.writes) != 0 {
 		t.Fatalf("writes = %d, want 0 when lock is not acquired", len(data.writes))
 	}
@@ -79,10 +110,46 @@ func TestFlushAccessCountsSkipsWhenLockNotAcquired(t *testing.T) {
 	}
 }
 
+func TestFlushAccessCountsReportsInvalidAndNonPositiveEntries(t *testing.T) {
+	ctx := context.Background()
+	tableName := "url_map"
+	key := accessCountRedisKey(tableName)
+	cache := newFakeAccessCountCache(true)
+	cache.hashes[key] = map[string]int64{
+		"321": 0,
+		"654": 4,
+	}
+	cache.rawEntries[key] = []string{
+		"bad-id", "9",
+		"321", "0",
+		"654", "4",
+	}
+	data := &fakeAccessCountData{}
+
+	stats, err := flushAccessCountsWithDeps(ctx, cache, data, []string{tableName}, 1710000003)
+	if err != nil {
+		t.Fatalf("flushAccessCountsWithDeps error = %v, want nil", err)
+	}
+
+	tableStats := stats.Tables[0]
+	if tableStats.ScannedEntries != 3 || tableStats.InvalidEntries != 1 || tableStats.NonPositiveEntries != 1 {
+		t.Fatalf("table stats = %#v, want invalid=1 non_positive=1 scanned=3", tableStats)
+	}
+	if tableStats.FlushedRows != 1 || tableStats.FlushedCount != 4 {
+		t.Fatalf("flush stats = %#v, want one flushed count 4", tableStats)
+	}
+	if _, ok := cache.hashes[key]["321"]; ok {
+		t.Fatal("non-positive entry still exists in redis hash")
+	}
+}
+
 type fakeAccessCountCache struct {
 	locked             bool
 	hashes             map[string]map[string]int64
 	addBeforeDecrement map[string]map[string]int64
+	rawEntries         map[string][]string
+	lockToken          string
+	unlockToken        string
 	unlockCalls        int
 }
 
@@ -91,19 +158,26 @@ func newFakeAccessCountCache(locked bool) *fakeAccessCountCache {
 		locked:             locked,
 		hashes:             map[string]map[string]int64{},
 		addBeforeDecrement: map[string]map[string]int64{},
+		rawEntries:         map[string][]string{},
 	}
 }
 
-func (c *fakeAccessCountCache) TryLock(_ context.Context, _ string, _ time.Duration) (bool, error) {
+func (c *fakeAccessCountCache) TryLock(_ context.Context, _ string, ownerToken string, _ time.Duration) (bool, error) {
+	c.lockToken = ownerToken
 	return c.locked, nil
 }
 
-func (c *fakeAccessCountCache) Unlock(_ context.Context, _ string) error {
+func (c *fakeAccessCountCache) Unlock(_ context.Context, _ string, ownerToken string) error {
+	c.unlockToken = ownerToken
 	c.unlockCalls++
 	return nil
 }
 
 func (c *fakeAccessCountCache) Scan(_ context.Context, key string, _ uint64, _ int64) ([]string, uint64, error) {
+	if entries, ok := c.rawEntries[key]; ok {
+		return append([]string(nil), entries...), 0, nil
+	}
+
 	fields := c.hashes[key]
 	names := make([]string, 0, len(fields))
 	for field := range fields {
