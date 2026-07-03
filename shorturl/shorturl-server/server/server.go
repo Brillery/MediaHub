@@ -39,19 +39,20 @@ const (
 // shortUrlService 实现了 proto.ShortUrlServer 接口，提供短链接相关服务。
 type shortUrlService struct {
 	proto.UnimplementedShortUrlServer
-	config            *config.Config // 配置信息
-	log               log.ILogger    // 日志记录器
-	urlMapDataFactory data.IUrlMapDataFactory
-	kvCacheFactory    cache.CacheFactory
-	lockFactory       cache.DistributedLockFactory
-	bloomFactory      cache.BloomFilterFactory
-	bloomFilter       cache.BloomFilter
-	userBloomFilter   cache.BloomFilter
-	cacheWarmer       cache.CacheWarmer
+	config               *config.Config // 配置信息
+	log                  log.ILogger    // 日志记录器
+	urlMapDataFactory    data.IUrlMapDataFactory
+	kvCacheFactory       cache.CacheFactory
+	lockFactory          cache.DistributedLockFactory
+	bloomFactory         cache.BloomFilterFactory
+	accessCounterFactory cache.AccessCounterFactory
+	bloomFilter          cache.BloomFilter
+	userBloomFilter      cache.BloomFilter
+	cacheWarmer          cache.CacheWarmer
 }
 
 // NewService 创建一个新的短链接服务实例
-func NewService(cnf *config.Config, logger log.ILogger, urlDataFactory data.IUrlMapDataFactory, kvCacheFactory cache.CacheFactory, lockFactory cache.DistributedLockFactory, bloomFactory cache.BloomFilterFactory) proto.ShortUrlServer {
+func NewService(cnf *config.Config, logger log.ILogger, urlDataFactory data.IUrlMapDataFactory, kvCacheFactory cache.CacheFactory, lockFactory cache.DistributedLockFactory, bloomFactory cache.BloomFilterFactory, accessCounterFactory cache.AccessCounterFactory) proto.ShortUrlServer {
 	// 创建缓存预热器
 	kvCache := kvCacheFactory.NewKVCache()
 	bloomFilter := bloomFactory.NewBloomFilter("shorturl:bloom", 100000, 0.01)
@@ -62,15 +63,16 @@ func NewService(cnf *config.Config, logger log.ILogger, urlDataFactory data.IUrl
 
 	// 创建服务实例
 	service := &shortUrlService{
-		config:            cnf,
-		log:               logger,
-		urlMapDataFactory: urlDataFactory,
-		kvCacheFactory:    kvCacheFactory,
-		lockFactory:       lockFactory,
-		bloomFactory:      bloomFactory,
-		bloomFilter:       bloomFilter,
-		userBloomFilter:   userBloomFilter,
-		cacheWarmer:       cacheWarmer,
+		config:               cnf,
+		log:                  logger,
+		urlMapDataFactory:    urlDataFactory,
+		kvCacheFactory:       kvCacheFactory,
+		lockFactory:          lockFactory,
+		bloomFactory:         bloomFactory,
+		accessCounterFactory: accessCounterFactory,
+		bloomFilter:          bloomFilter,
+		userBloomFilter:      userBloomFilter,
+		cacheWarmer:          cacheWarmer,
 	}
 
 	// 启动缓存预热
@@ -359,17 +361,36 @@ func (s *shortUrlService) GetOriginalUrl(ctx context.Context, in *proto.ShortKey
 		}
 	}
 
-	// 增加短链接访问次数（错误时仅记录日志不影响返回）
-	err = d.IncrementTimes(id, 1, time.Now().Unix())
-	if err != nil {
-		s.log.Warning(err)
-		err = nil
-	}
+	// 访问计数是统计侧副作用，不能阻断短链跳转。
+	// 这里只写 Redis 增量；MySQL times 由 shorturl-crontab 批量落库，避免高频访问同步打到数据库。
+	s.recordAccessCount(isPublic, id)
 
 	return &proto.Url{
 		Url:    originalUrl,
 		UserID: in.UserID,
 	}, nil
+}
+
+// recordAccessCount 记录一次短链访问。
+//
+// 并发边界：多实例请求都通过 Redis HINCRBY 聚合到同一 table/id 字段；
+// 这里不直接写 MySQL，crontab 会按快照扣减 Redis 并批量更新数据库，避免解析请求承担同步写库成本。
+func (s *shortUrlService) recordAccessCount(isPublic bool, id int64) {
+	if s.accessCounterFactory == nil {
+		s.log.Warning("短链访问计数器未初始化，跳过本次计数")
+		return
+	}
+
+	tableName := constants.TABLENAME_URL_MAP
+	if !isPublic {
+		tableName = constants.TABLENAME_URL_MAP_USER
+	}
+
+	counter := s.accessCounterFactory.NewAccessCounter()
+	defer counter.Destroy()
+	if err := counter.Increment(tableName, id); err != nil {
+		s.log.Warning("记录短链访问计数失败: " + err.Error())
+	}
 }
 
 // resolveOriginalURLOnCacheMiss 处理短链缓存未命中后的回源流程。

@@ -65,6 +65,55 @@ func TestGetOriginalUrlWritesNegativeCacheOnDBMiss(t *testing.T) {
 	}
 }
 
+func TestGetOriginalUrlRecordsAccessCountToCounter(t *testing.T) {
+	id := int64(123)
+	key := utils.ToBase62(id)
+	kvCache := newFakeKVCache(map[string]string{
+		key: "https://img.example.com/cached.jpg",
+	})
+	counter := &fakeAccessCounter{}
+	urlData := &fakeURLMapData{}
+	service := newTestShortURLServiceWithAccessCounter(kvCache, urlData, counter)
+
+	out, err := service.GetOriginalUrl(context.Background(), &proto.ShortKey{Key: key, IsPublic: true})
+	if err != nil {
+		t.Fatalf("GetOriginalUrl error = %v, want nil", err)
+	}
+	if out.GetUrl() != "https://img.example.com/cached.jpg" {
+		t.Fatalf("original url = %q, want cached url", out.GetUrl())
+	}
+	if counter.incrementCalls != 1 {
+		t.Fatalf("access counter calls = %d, want 1", counter.incrementCalls)
+	}
+	if counter.tableName != "url_map" || counter.id != id {
+		t.Fatalf("access counter target = %s/%d, want url_map/%d", counter.tableName, counter.id, id)
+	}
+	if urlData.incrementCalls != 0 {
+		t.Fatalf("IncrementTimes calls = %d, want 0 because access count is aggregated in Redis", urlData.incrementCalls)
+	}
+}
+
+func TestGetOriginalUrlIgnoresAccessCounterError(t *testing.T) {
+	id := int64(124)
+	key := utils.ToBase62(id)
+	kvCache := newFakeKVCache(map[string]string{
+		key: "https://img.example.com/still-return.jpg",
+	})
+	counter := &fakeAccessCounter{err: errors.New("redis unavailable")}
+	service := newTestShortURLServiceWithAccessCounter(kvCache, &fakeURLMapData{}, counter)
+
+	out, err := service.GetOriginalUrl(context.Background(), &proto.ShortKey{Key: key, IsPublic: true})
+	if err != nil {
+		t.Fatalf("GetOriginalUrl error = %v, want nil when only access counter fails", err)
+	}
+	if out.GetUrl() != "https://img.example.com/still-return.jpg" {
+		t.Fatalf("original url = %q, want cached url", out.GetUrl())
+	}
+	if counter.incrementCalls != 1 {
+		t.Fatalf("access counter calls = %d, want 1", counter.incrementCalls)
+	}
+}
+
 func TestGetShortUrlRechecksOriginalURLAfterCreationLock(t *testing.T) {
 	originalURL := "https://img.example.com/reused.jpg"
 	kvCache := newFakeKVCache(nil)
@@ -128,6 +177,12 @@ func newTestShortURLService(kvCache *fakeKVCache, urlData *fakeURLMapData) *shor
 	return newTestShortURLServiceWithLock(kvCache, urlData, &fakeLock{locked: true})
 }
 
+func newTestShortURLServiceWithAccessCounter(kvCache *fakeKVCache, urlData *fakeURLMapData, counter *fakeAccessCounter) *shortUrlService {
+	service := newTestShortURLService(kvCache, urlData)
+	service.accessCounterFactory = &fakeAccessCounterFactory{counter: counter}
+	return service
+}
+
 func newTestShortURLServiceWithLock(kvCache *fakeKVCache, urlData *fakeURLMapData, lock *fakeLock) *shortUrlService {
 	return &shortUrlService{
 		config: &config.Config{
@@ -138,6 +193,9 @@ func newTestShortURLServiceWithLock(kvCache *fakeKVCache, urlData *fakeURLMapDat
 		urlMapDataFactory: &fakeURLMapDataFactory{urlData: urlData},
 		kvCacheFactory:    &fakeCacheFactory{kvCache: kvCache},
 		lockFactory:       &fakeLockFactory{lock: lock},
+		accessCounterFactory: &fakeAccessCounterFactory{
+			counter: &fakeAccessCounter{},
+		},
 	}
 }
 
@@ -259,3 +317,27 @@ func (d *fakeURLMapData) IncrementTimes(_ int64, _ int, _ int64) error {
 func (d *fakeURLMapData) GetTopUrls(_ int) ([]mapdata.UrlMapEntity, error) {
 	return nil, nil
 }
+
+type fakeAccessCounterFactory struct {
+	counter *fakeAccessCounter
+}
+
+func (f *fakeAccessCounterFactory) NewAccessCounter() cache.AccessCounter {
+	return f.counter
+}
+
+type fakeAccessCounter struct {
+	err            error
+	tableName      string
+	id             int64
+	incrementCalls int
+}
+
+func (c *fakeAccessCounter) Increment(tableName string, id int64) error {
+	c.incrementCalls++
+	c.tableName = tableName
+	c.id = id
+	return c.err
+}
+
+func (c *fakeAccessCounter) Destroy() {}
