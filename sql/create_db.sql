@@ -9,12 +9,16 @@ CREATE TABLE `mediahub`.`url_map` (
                                       `id` BIGINT(20) NOT NULL AUTO_INCREMENT,  -- 主键，自增ID
                                       `short_key` VARCHAR(45) NOT NULL DEFAULT '',  -- 短链接的唯一标识
                                       `original_url` VARCHAR(512) NOT NULL DEFAULT '',  -- 原始URL
+                                      `original_url_unique` VARCHAR(512)
+                                          GENERATED ALWAYS AS (NULLIF(`original_url`, '')) STORED
+                                          COMMENT '非空 original_url 唯一约束用生成列，空占位行转为 NULL',
                                       `times` INT NOT NULL DEFAULT 0,  -- 该短链接被访问的次数
                                       `create_at` BIGINT(64) NOT NULL DEFAULT 0,  -- 记录创建时间的时间戳
                                       `update_at` BIGINT(64) NOT NULL DEFAULT 0,  -- 记录最后一次更新时间的时间戳
                                       PRIMARY KEY (`id`),  -- 设置 `id` 为主键
                                       INDEX `index_short_key` (`short_key` ASC) VISIBLE,  -- 在 `short_key` 字段上创建索引
-                                      INDEX `index_original_url` (`original_url` ASC) VISIBLE)  -- 在 `original_url` 字段上创建索引
+                                      INDEX `index_original_url` (`original_url` ASC) VISIBLE,  -- 在 `original_url` 字段上创建索引
+                                      UNIQUE INDEX `uk_url_map_original_url_non_empty` (`original_url_unique` ASC) VISIBLE)  -- 约束非空原始URL不重复，允许创建流程中的空占位行并发存在
     ENGINE = InnoDB  -- 使用 InnoDB 存储引擎
 DEFAULT CHARACTER SET = utf8mb4  -- 设置默认字符集为 `utf8mb4`
 COMMENT = 'url关系表';  -- 表注释，说明该表用于存储URL映射关系
@@ -25,12 +29,16 @@ CREATE TABLE `mediahub`.`url_map_user` (
                                            `user_id` BIGINT(20) NOT NULL DEFAULT 0,  -- 用户ID，关联到具体用户
                                            `short_key` VARCHAR(45) NOT NULL DEFAULT '',  -- 短链接的唯一标识
                                            `original_url` VARCHAR(512) NOT NULL DEFAULT '',  -- 原始URL
+                                           `original_url_unique` VARCHAR(512)
+                                               GENERATED ALWAYS AS (NULLIF(`original_url`, '')) STORED
+                                               COMMENT '非空 original_url 唯一约束用生成列，空占位行转为 NULL',
                                            `times` INT NOT NULL DEFAULT 0,  -- 该短链接被访问的次数
                                            `create_at` BIGINT(64) NOT NULL DEFAULT 0,  -- 记录创建时间的时间戳
                                            `update_at` BIGINT(64) NOT NULL DEFAULT 0,  -- 记录最后一次更新时间的时间戳
                                            PRIMARY KEY (`id`),  -- 设置 `id` 为主键
                                            INDEX `index_short_key` (`short_key` ASC) VISIBLE,  -- 在 `short_key` 字段上创建索引
-                                           INDEX `index_original_url` (`original_url` ASC) VISIBLE)  -- 在 `original_url` 字段上创建索引
+                                           INDEX `index_original_url` (`original_url` ASC) VISIBLE,  -- 在 `original_url` 字段上创建索引
+                                           UNIQUE INDEX `uk_url_map_user_original_url_non_empty` (`user_id` ASC, `original_url_unique` ASC) VISIBLE)  -- 约束同一用户下非空原始URL不重复，允许不同用户使用同一URL
     ENGINE = InnoDB  -- 使用 InnoDB 存储引擎
 DEFAULT CHARACTER SET = utf8mb4  -- 设置默认字符集为 `utf8mb4`
 COMMENT = 'url关系表';  -- 表注释，说明该表用于存储用户与URL的映射关系
