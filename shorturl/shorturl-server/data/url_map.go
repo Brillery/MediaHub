@@ -145,11 +145,12 @@ func (d *urlMapData) GetByID(id int64) (*UrlMapEntity, error) {
 //   - 查询到的实体对象（未找到时各字段为零值）
 //   - 错误信息（数据库操作失败时）
 func (d *urlMapData) GetByOriginal(originalUrl string) (UrlMapEntity, error) {
-	sqlStr := fmt.Sprintf("select id, short_key from %s where original_url = ?", d.tableName)
+	sqlStr := fmt.Sprintf("select id, short_key, original_url from %s where original_url = ?", d.tableName)
 	row := d.db.QueryRow(sqlStr, originalUrl)
 	entity := UrlMapEntity{}
 	var shortKey sql.NullString
-	err := row.Scan(&entity.ID, &shortKey)
+	var storedOriginalURL sql.NullString
+	err := row.Scan(&entity.ID, &shortKey, &storedOriginalURL)
 	// 处理非预期错误
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		d.log.Error(zerror.NewByErr(err))
@@ -157,6 +158,9 @@ func (d *urlMapData) GetByOriginal(originalUrl string) (UrlMapEntity, error) {
 	}
 	if shortKey.Valid {
 		entity.ShortKey = shortKey.String
+	}
+	if storedOriginalURL.Valid {
+		entity.OriginalUrl = storedOriginalURL.String
 	}
 	return entity, nil
 }

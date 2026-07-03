@@ -1,0 +1,67 @@
+name: MediaHub CI
+
+on:
+  push:
+    branches:
+      - master
+      - 'cz/**'
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  go-tests:
+    name: Go Tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - mediahub
+          - shorturl
+          - shorturl-proxy
+          - shorturl-crontab
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          # 本仓多个 Go module 的 go.mod 版本不完全一致，CI 使用当前本地验证过的高版本统一执行。
+          go-version: '1.26.x'
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: Run go tests
+        working-directory: ${{ matrix.module }}
+        run: go test ./...
+
+  frontend-build:
+    name: Frontend Build And Production Audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mediahub-web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # 锁定到本地验证使用的 Node 主版本，避免 CI 和开发环境解析依赖树时出现差异。
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: mediahub-web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev

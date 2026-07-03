@@ -2,9 +2,12 @@ package server
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"shorturl/pkg/config"
 	"shorturl/pkg/log"
 	"shorturl/pkg/utils"
 	"shorturl/proto"
@@ -62,12 +65,79 @@ func TestGetOriginalUrlWritesNegativeCacheOnDBMiss(t *testing.T) {
 	}
 }
 
+func TestGetShortUrlRechecksOriginalURLAfterCreationLock(t *testing.T) {
+	originalURL := "https://img.example.com/reused.jpg"
+	kvCache := newFakeKVCache(nil)
+	urlData := &fakeURLMapData{
+		originalResults: []mapdata.UrlMapEntity{
+			{},
+			{ID: 88, ShortKey: "1q", OriginalUrl: originalURL},
+		},
+	}
+	lock := &fakeLock{locked: true}
+	service := newTestShortURLServiceWithLock(kvCache, urlData, lock)
+
+	out, err := service.GetShortUrl(context.Background(), &proto.Url{Url: originalURL, IsPublic: true})
+	if err != nil {
+		t.Fatalf("GetShortUrl error = %v, want nil", err)
+	}
+	if out.GetUrl() != "https://short.example/1q" {
+		t.Fatalf("short url = %q, want %q", out.GetUrl(), "https://short.example/1q")
+	}
+	if urlData.getByOriginalCalls != 2 {
+		t.Fatalf("GetByOriginal calls = %d, want 2", urlData.getByOriginalCalls)
+	}
+	if urlData.generateCalls != 0 || urlData.updateCalls != 0 {
+		t.Fatalf("GenerateID/Update calls = %d/%d, want 0/0", urlData.generateCalls, urlData.updateCalls)
+	}
+	if got := kvCache.values["1q"]; got != originalURL {
+		t.Fatalf("cache value = %q, want %q", got, originalURL)
+	}
+	if len(lock.keys) != 1 {
+		t.Fatalf("lock keys = %#v, want exactly one creation lock", lock.keys)
+	}
+	if strings.Contains(lock.keys[0], originalURL) {
+		t.Fatalf("lock key %q should not contain raw original URL", lock.keys[0])
+	}
+}
+
+func TestGetShortUrlFallsBackToDirectCreateWhenCreationLockErrors(t *testing.T) {
+	originalURL := "https://img.example.com/new.jpg"
+	kvCache := newFakeKVCache(nil)
+	urlData := &fakeURLMapData{generatedID: 321}
+	lock := &fakeLock{lockErr: errors.New("redis unavailable")}
+	service := newTestShortURLServiceWithLock(kvCache, urlData, lock)
+
+	out, err := service.GetShortUrl(context.Background(), &proto.Url{Url: originalURL, IsPublic: true})
+	if err != nil {
+		t.Fatalf("GetShortUrl error = %v, want nil", err)
+	}
+	wantShortKey := utils.ToBase62(321)
+	if out.GetUrl() != "https://short.example/"+wantShortKey {
+		t.Fatalf("short url = %q, want %q", out.GetUrl(), "https://short.example/"+wantShortKey)
+	}
+	if urlData.generateCalls != 1 || urlData.updateCalls != 1 {
+		t.Fatalf("GenerateID/Update calls = %d/%d, want 1/1", urlData.generateCalls, urlData.updateCalls)
+	}
+	if urlData.updatedEntity.OriginalUrl != originalURL {
+		t.Fatalf("updated original url = %q, want %q", urlData.updatedEntity.OriginalUrl, originalURL)
+	}
+}
+
 func newTestShortURLService(kvCache *fakeKVCache, urlData *fakeURLMapData) *shortUrlService {
+	return newTestShortURLServiceWithLock(kvCache, urlData, &fakeLock{locked: true})
+}
+
+func newTestShortURLServiceWithLock(kvCache *fakeKVCache, urlData *fakeURLMapData, lock *fakeLock) *shortUrlService {
 	return &shortUrlService{
+		config: &config.Config{
+			ShortDomain:     "https://short.example/",
+			UserShortDomain: "https://user-short.example/",
+		},
 		log:               log.NewLogger(),
 		urlMapDataFactory: &fakeURLMapDataFactory{urlData: urlData},
 		kvCacheFactory:    &fakeCacheFactory{kvCache: kvCache},
-		lockFactory:       &fakeLockFactory{lock: &fakeLock{locked: true}},
+		lockFactory:       &fakeLockFactory{lock: lock},
 	}
 }
 
@@ -107,10 +177,16 @@ func (f *fakeCacheFactory) NewKVCache() cache.KVCache {
 }
 
 type fakeLock struct {
-	locked bool
+	locked  bool
+	lockErr error
+	keys    []string
 }
 
-func (l *fakeLock) Lock(_ string, _ time.Duration) (bool, error) {
+func (l *fakeLock) Lock(key string, _ time.Duration) (bool, error) {
+	l.keys = append(l.keys, key)
+	if l.lockErr != nil {
+		return false, l.lockErr
+	}
 	return l.locked, nil
 }
 
@@ -135,16 +211,28 @@ func (f *fakeURLMapDataFactory) NewUrlMapData(_ bool) mapdata.IUrlMapData {
 }
 
 type fakeURLMapData struct {
-	entity         *mapdata.UrlMapEntity
-	getByIDCalls   int
-	incrementCalls int
+	entity             *mapdata.UrlMapEntity
+	originalResults    []mapdata.UrlMapEntity
+	generatedID        int64
+	updatedEntity      mapdata.UrlMapEntity
+	getByIDCalls       int
+	getByOriginalCalls int
+	generateCalls      int
+	updateCalls        int
+	incrementCalls     int
 }
 
 func (d *fakeURLMapData) GenerateID(_, _ int64) (int64, error) {
-	return 0, nil
+	d.generateCalls++
+	if d.generatedID != 0 {
+		return d.generatedID, nil
+	}
+	return 1, nil
 }
 
-func (d *fakeURLMapData) Update(_ mapdata.UrlMapEntity) error {
+func (d *fakeURLMapData) Update(entity mapdata.UrlMapEntity) error {
+	d.updateCalls++
+	d.updatedEntity = entity
 	return nil
 }
 
@@ -154,6 +242,12 @@ func (d *fakeURLMapData) GetByID(_ int64) (*mapdata.UrlMapEntity, error) {
 }
 
 func (d *fakeURLMapData) GetByOriginal(_ string) (mapdata.UrlMapEntity, error) {
+	d.getByOriginalCalls++
+	if len(d.originalResults) > 0 {
+		entity := d.originalResults[0]
+		d.originalResults = d.originalResults[1:]
+		return entity, nil
+	}
 	return mapdata.UrlMapEntity{}, nil
 }
 
