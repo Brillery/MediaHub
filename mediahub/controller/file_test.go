@@ -6,6 +6,10 @@ import (
 	"enterprise-project1-mediahub/mediahub/pkg/config"
 	"enterprise-project1-mediahub/mediahub/pkg/log"
 	"enterprise-project1-mediahub/mediahub/pkg/storage"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -24,11 +28,13 @@ func (f *fakeStorageFactory) CreateStorage() storage.Storage {
 }
 
 type fakeStorage struct {
-	called bool
+	called  bool
+	dstPath string
 }
 
-func (s *fakeStorage) Upload(_ io.Reader, _ []byte, _ string) (string, error) {
+func (s *fakeStorage) Upload(_ io.Reader, _ []byte, dstPath string) (string, error) {
 	s.called = true
+	s.dstPath = dstPath
 	return "https://img.example.com/uploaded.jpg", nil
 }
 
@@ -83,6 +89,21 @@ func TestCalMD5Digest(t *testing.T) {
 	}
 }
 
+func TestBuildUploadFilePathUsesDetectedImageExtension(t *testing.T) {
+	content := jpegImageBytes(t)
+	meta, ok := detectUploadImage(bytes.NewReader(content))
+	if !ok {
+		t.Fatal("detectUploadImage returned false for a valid jpeg")
+	}
+
+	digest := calMD5Digest(content)
+	got := buildUploadFilePath(42, digest, meta)
+	want := fmt.Sprintf("/42/%x.jpg", digest)
+	if got != want {
+		t.Fatalf("file path = %q, want %q", got, want)
+	}
+}
+
 func multipartBody(t *testing.T, fieldName, fileName string, content []byte) (*bytes.Buffer, string) {
 	t.Helper()
 
@@ -99,4 +120,17 @@ func multipartBody(t *testing.T, fieldName, fileName string, content []byte) (*b
 		t.Fatalf("close multipart writer failed: %v", err)
 	}
 	return body, writer.FormDataContentType()
+}
+
+func jpegImageBytes(t *testing.T) []byte {
+	t.Helper()
+
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatalf("jpeg.Encode failed: %v", err)
+	}
+	return buf.Bytes()
 }
