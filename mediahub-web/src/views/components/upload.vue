@@ -18,7 +18,8 @@
 <script lang="ts" setup>
 import {ref} from 'vue' 
 import {uploadFile} from '../../api/api'
-import {ElMessage,ElLoading} from 'element-plus'
+import {ElLoading} from 'element-plus/es/components/loading/index'
+import {ElMessage} from 'element-plus/es/components/message/index'
 const data = {
     url: ref("") 
 } 
