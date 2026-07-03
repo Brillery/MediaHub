@@ -14,9 +14,6 @@ import (
 	"enterprise-project1-mediahub/mediahub/pkg/log"
 	"enterprise-project1-mediahub/mediahub/pkg/storage"
 	"enterprise-project1-mediahub/mediahub/pkg/zerror"
-	"enterprise-project1-mediahub/mediahub/services"
-	"enterprise-project1-mediahub/mediahub/services/shorturl"
-	"enterprise-project1-mediahub/mediahub/services/shorturl/proto"
 	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin"
@@ -42,6 +39,9 @@ type Controller struct {
 	sf     storage.StorageFactory
 	log    log.ILogger
 	config *config.Config
+	// shortener 是上传成功后的短链生成边界。
+	// 生产环境使用 gRPC 实现，测试注入 fake，避免成功上传路径必须依赖外部 shorturl 服务。
+	shortener ShortURLGenerator
 }
 
 // uploadImageMetadata 是上传链路识别出的图片格式元数据。
@@ -63,10 +63,18 @@ const (
 )
 
 func NewController(sf storage.StorageFactory, logger log.ILogger, cnf *config.Config) *Controller {
+	return NewControllerWithShortener(sf, logger, cnf, newGRPCShortURLGenerator(cnf))
+}
+
+// NewControllerWithShortener 创建可注入短链生成器的上传控制器。
+//
+// 该构造函数主要服务单元测试和未来替换 shorturl 适配器；生产入口继续使用 NewController，保持路由初始化不变。
+func NewControllerWithShortener(sf storage.StorageFactory, logger log.ILogger, cnf *config.Config, shortener ShortURLGenerator) *Controller {
 	return &Controller{
-		sf:     sf,
-		log:    logger,
-		config: cnf,
+		sf:        sf,
+		log:       logger,
+		config:    cnf,
+		shortener: shortener,
 	}
 }
 
@@ -134,33 +142,8 @@ func (c *Controller) Upload(ctx *gin.Context) {
 		return
 	}
 
-	shortPool := shorturl.NewShortUrlClientPool()
-	clientConn := shortPool.Get()
-	defer shortPool.Put(clientConn)
-
-	// 生成短链接
-	// 现在有了pool就不用自己dial了
-	//target := "localhost:50051"
-	//clientConn, err := grpc.Dial(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	//if err != nil {
-	//	c.log.Error(zerror.NewByErr(err))
-	//	ctx.JSON(http.StatusInternalServerError, gin.H{})
-	//	return
-	//}
-	//defer clientConn.Close()
-
-	client := proto.NewShortUrlClient(clientConn)
-	in := &proto.Url{
-		Url:      url,
-		UserID:   userId,
-		IsPublic: userId == 0,
-	}
-
-	// 加一个拦截器认证参数
-	outGoingCtx := context.Background()
-	outGoingCtx = services.AppendBearerTokenToContext(outGoingCtx, c.config.DependOn.ShortUrl.AccessToken)
-
-	outUrl, err := client.GetShortUrl(outGoingCtx, in)
+	// 对象存储成功后再生成短链；短链失败时不能返回对象存储原始 URL，避免前端拿到未纳入短链系统的地址。
+	outUrl, err := c.shortener.Generate(context.Background(), url, userId, userId == 0)
 	if err != nil {
 		c.log.Error(zerror.NewByErr(err))
 		ctx.JSON(http.StatusInternalServerError, gin.H{})
@@ -168,7 +151,7 @@ func (c *Controller) Upload(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{
-		"url":       outUrl.Url,
+		"url":       outUrl,
 		"user_name": userName,
 		"msg":       "上传成功",
 	})

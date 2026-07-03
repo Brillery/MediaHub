@@ -2,7 +2,10 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
+	"encoding/json"
+	"enterprise-project1-mediahub/mediahub/middleware"
 	"enterprise-project1-mediahub/mediahub/pkg/config"
 	"enterprise-project1-mediahub/mediahub/pkg/log"
 	"enterprise-project1-mediahub/mediahub/pkg/storage"
@@ -14,6 +17,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +40,66 @@ func (s *fakeStorage) Upload(_ io.Reader, _ []byte, dstPath string) (string, err
 	s.called = true
 	s.dstPath = dstPath
 	return "https://img.example.com/uploaded.jpg", nil
+}
+
+type fakeShortener struct {
+	called      bool
+	originalURL string
+	userID      int64
+	isPublic    bool
+}
+
+func (s *fakeShortener) Generate(_ context.Context, originalURL string, userID int64, isPublic bool) (string, error) {
+	s.called = true
+	s.originalURL = originalURL
+	s.userID = userID
+	s.isPublic = isPublic
+	return "https://short.example/abc", nil
+}
+
+func TestUploadStoresImageAndReturnsShortURL(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fakeStorage := &fakeStorage{}
+	shortener := &fakeShortener{}
+	controller := NewControllerWithShortener(&fakeStorageFactory{storage: fakeStorage}, log.NewLogger(), &config.Config{}, shortener)
+	body, contentType := multipartBody(t, "file", "avatar.txt", jpegImageBytes(t))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/file/upload", body)
+	req.Header.Set("Content-Type", contentType)
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = req
+	ctx.Set(middleware.AuthUserIDKey, int64(42))
+
+	controller.Upload(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want %d", rec.Code, rec.Body.String(), http.StatusOK)
+	}
+	var payload struct {
+		URL string `json:"url"`
+		Msg string `json:"msg"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json response decode failed: %v", err)
+	}
+	if payload.URL != "https://short.example/abc" {
+		t.Fatalf("response url = %q, want shortener result", payload.URL)
+	}
+	if !fakeStorage.called {
+		t.Fatal("storage should be called for a valid image")
+	}
+	if !strings.HasPrefix(fakeStorage.dstPath, "/42/") || !strings.HasSuffix(fakeStorage.dstPath, ".jpg") {
+		t.Fatalf("storage path = %q, want user scoped .jpg path", fakeStorage.dstPath)
+	}
+	if !shortener.called {
+		t.Fatal("shortener should be called after storage upload")
+	}
+	if shortener.originalURL != "https://img.example.com/uploaded.jpg" {
+		t.Fatalf("shortener original url = %q, want storage url", shortener.originalURL)
+	}
+	if shortener.userID != 42 || shortener.isPublic {
+		t.Fatalf("shortener scope userID/isPublic = %d/%v, want 42/false", shortener.userID, shortener.isPublic)
+	}
 }
 
 func TestUploadRejectsInvalidImageBeforeStorage(t *testing.T) {
