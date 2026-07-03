@@ -1,4 +1,4 @@
--- MediaHub shorturl 非空原始 URL 唯一约束迁移草案。
+-- MediaHub shorturl 非空原始 URL 唯一约束正式迁移脚本。
 --
 -- 背景：
 -- - shorturl 当前创建流程是先插入占位行，再把 short_key/original_url 回写到同一行。
@@ -10,6 +10,11 @@
 -- - 先执行“重复数据检查”。
 -- - 如果检查结果有行，必须人工确认保留哪条短链并清理重复记录后，再执行 ALTER。
 -- - 本脚本不自动 DELETE 数据，避免误删线上短链。
+-- - DDL 建议在业务低峰执行；如果表数据量较大，需要先确认 MySQL 版本和 Online DDL 能力。
+--
+-- 回滚边界：
+-- - 本迁移只增加 generated column 和唯一索引，不改业务列。
+-- - 如需回滚，先 DROP 唯一索引，再 DROP generated column，见文末“回滚语句”。
 
 USE mediahub;
 
@@ -69,3 +74,29 @@ ALTER TABLE url_map_user
     GENERATED ALWAYS AS (NULLIF(original_url, '')) STORED
     COMMENT '非空 original_url 唯一约束用生成列，空占位行转为 NULL',
   ADD UNIQUE INDEX uk_url_map_user_original_url_non_empty (user_id, original_url_unique);
+
+-- 5. DDL 完成后执行以下检查，确认唯一索引与生成列已存在。
+SHOW INDEX FROM url_map WHERE Key_name = 'uk_url_map_original_url_non_empty';
+SHOW INDEX FROM url_map_user WHERE Key_name = 'uk_url_map_user_original_url_non_empty';
+
+SELECT id, original_url, original_url_unique
+FROM url_map
+WHERE original_url <> ''
+ORDER BY id
+LIMIT 10;
+
+SELECT id, user_id, original_url, original_url_unique
+FROM url_map_user
+WHERE original_url <> ''
+ORDER BY id
+LIMIT 10;
+
+-- 6. 回滚语句。
+-- 只有在确认业务需要回滚、且没有依赖该唯一约束的新代码后再执行。
+-- ALTER TABLE url_map
+--   DROP INDEX uk_url_map_original_url_non_empty,
+--   DROP COLUMN original_url_unique;
+--
+-- ALTER TABLE url_map_user
+--   DROP INDEX uk_url_map_user_original_url_non_empty,
+--   DROP COLUMN original_url_unique;

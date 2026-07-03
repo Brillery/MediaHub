@@ -108,7 +108,7 @@ cd ../shorturl-crontab && go test ./...
 Expected:
 - 两个模块测试全部通过。
 
-- [ ] **Step 3: 提交**
+- [x] **Step 3: 提交**
 
 ```bash
 git add docs/superpowers/plans/2026-07-03-mediahub-batch-8.md
