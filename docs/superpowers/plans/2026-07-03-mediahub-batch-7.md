@@ -45,7 +45,7 @@ Expected:
 - Modify: `mediahub-web/src/request/axios.ts`
 - Modify: `mediahub-web/src/views/components/upload.vue`
 
-- [ ] **Step 1: 替换组件根入口导入**
+- [x] **Step 1: 替换组件根入口导入**
 
 在 `src/main.ts` 中把 `element-plus` 根入口改为组件子路径：
 
@@ -56,7 +56,7 @@ import { ElCarousel, ElCarouselItem } from 'element-plus/es/components/carousel/
 import { ElMenu, ElMenuItem, ElSubMenu } from 'element-plus/es/components/menu/index'
 ```
 
-- [ ] **Step 2: 替换服务 API 根入口导入**
+- [x] **Step 2: 替换服务 API 根入口导入**
 
 在 axios 拦截器中使用：
 
@@ -71,7 +71,7 @@ import { ElLoading } from 'element-plus/es/components/loading/index'
 import { ElMessage } from 'element-plus/es/components/message/index'
 ```
 
-- [ ] **Step 3: 保留现有 CSS 显式引入**
+- [x] **Step 3: 保留现有 CSS 显式引入**
 
 `src/main.ts` 中继续保留 `base.css`、组件 CSS、`el-message.css`、`el-loading.css`。这些样式是服务 API 运行时弹层展示的边界，不能因为 JS 按需导入而删掉。
 
@@ -80,7 +80,7 @@ import { ElMessage } from 'element-plus/es/components/message/index'
 **Files:**
 - Modify: `mediahub-web/vite.config.ts`
 
-- [ ] **Step 1: 删除 `element-plus` 聚合入口分包**
+- [x] **Step 1: 删除 `element-plus` 聚合入口分包**
 
 不要继续写：
 
@@ -92,7 +92,7 @@ manualChunks: {
 
 这个配置会把包的根入口当成稳定 chunk，容易把未使用的导出也拉到同一分析边界。
 
-- [ ] **Step 2: 改成基于模块路径的函数分包**
+- [x] **Step 2: 改成基于模块路径的函数分包**
 
 使用函数式 `manualChunks`：
 
@@ -116,7 +116,7 @@ manualChunks(id) {
 - Modify: `mediahub-web/src/views/components/upload.vue`
 - Modify: `mediahub-web/vite.config.ts`
 
-- [ ] **Step 1: 构建验证**
+- [x] **Step 1: 构建验证**
 
 Run:
 
@@ -127,8 +127,9 @@ cd mediahub-web && npm run build
 Expected:
 - 构建成功。
 - 不再出现 `Some chunks are larger than 500 kB after minification`。
+- 实际输出中最大 JS chunk 为 `elementPlus` 约 85 kB，`vendor` 约 53 kB，`vue` 约 77 kB。
 
-- [ ] **Step 2: 安全审计**
+- [x] **Step 2: 安全审计**
 
 Run:
 
@@ -139,7 +140,7 @@ cd mediahub-web && npm audit && npm audit --omit=dev
 Expected:
 - 两个命令都输出 `found 0 vulnerabilities`。
 
-- [ ] **Step 3: 提交**
+- [x] **Step 3: 提交**
 
 ```bash
 git add docs/superpowers/plans/2026-07-03-mediahub-batch-7.md

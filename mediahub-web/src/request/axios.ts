@@ -1,5 +1,5 @@
 import axios,{AxiosError} from "axios" 
-import { ElMessage } from 'element-plus'
+import { ElMessage } from 'element-plus/es/components/message/index'
 import { getCookie } from "../utils/utils.ts";
 
 const service = axios.create({
