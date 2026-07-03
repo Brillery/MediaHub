@@ -1,8 +1,11 @@
+// Package redis 提供常见缓存保护策略，便于业务按场景组合防穿透、击穿和雪崩。
+//
+// 策略只处理缓存访问流程，不感知业务对象含义；调用方必须保证 fetchFunc 自身具备
+// 权限边界、幂等语义和数据库查询成本控制。
 package redis
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
 	"time"
 )
@@ -328,4 +331,4 @@ func (s *AllProtectionsStrategy) Get(ctx context.Context, key string, fetchFunc 
 	s.cache.Delete(ctx, lockKey)
 
 	return data, nil
-} 
+}

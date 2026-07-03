@@ -1,3 +1,7 @@
+// Package middleware 提供 mediahub HTTP 服务的通用 Gin 中间件。
+//
+// Auth 中间件负责把前端携带的 SSO token 交给用户中心校验，并把可信用户信息写入
+// Gin Context。业务控制器只能读取这里写入的上下文值，不能信任前端表单里的 userId。
 package middleware
 
 import (
@@ -10,6 +14,16 @@ import (
 	"io"
 	"net/http"
 	"strings"
+)
+
+const (
+	// AuthUserIDKey 是鉴权中间件写入 Gin Context 的登录用户 ID。
+	// 控制器只能读取该 key，避免信任前端表单里的 user_id。
+	AuthUserIDKey = "user_id"
+	// AuthUserNameKey 是用户中心返回的用户昵称，主要用于响应展示或日志。
+	AuthUserNameKey = "user_name"
+	// AuthUserAvatarURLKey 是用户头像地址，只作为展示字段，不参与权限判断。
+	AuthUserAvatarURLKey = "avatar_url"
 )
 
 func Auth() gin.HandlerFunc {
@@ -29,9 +43,9 @@ func Auth() gin.HandlerFunc {
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
-		c.Set("User.ID", user.ID)
-		c.Set("User.Name", user.Name)
-		c.Set("User.AvatarUrl", user.AvatarUrl)
+		c.Set(AuthUserIDKey, user.ID)
+		c.Set(AuthUserNameKey, user.Name)
+		c.Set(AuthUserAvatarURLKey, user.AvatarUrl)
 		c.Next()
 	}
 }
@@ -69,7 +83,7 @@ func checkAuth(token string) (*userInfo, error) {
 		return nil, err
 	}
 
-	log.Info("Response body: %s", string(body))
+	log.InfoF("Response body: %s", string(body))
 
 	contentType := res.Header.Get("Content-Type")
 	if !strings.Contains(contentType, "application/json") {

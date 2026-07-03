@@ -1,1 +1,31 @@
 .idea/
+.DS_Store
+
+# Local dependency and build outputs.
+node_modules/
+dist/
+dist-ssr/
+.worktrees/
+worktrees/
+
+# Local environment and runtime config. Keep *.example files tracked.
+.env
+.env.*
+!.env.example
+*.local
+dev.config.yaml
+*.config.local.yaml
+!*.example.yaml
+
+# Runtime logs and temporary files.
+logs/
+runtime/
+*.log
+*.tmp
+
+# Packaged artifacts and local helper binaries.
+*.zip
+*.tar
+*.tar.gz
+*.exe
+*-amd64

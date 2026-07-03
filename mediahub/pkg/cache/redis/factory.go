@@ -1,3 +1,11 @@
+// Package redis 提供 mediahub 内部可复用的 Redis 缓存封装和策略工厂。
+//
+// 模块职责：
+// - 输入：Redis 地址、连接池参数和缓存策略类型。
+// - 输出：Cache 与 CacheStrategy，用于业务模块统一访问缓存。
+// - 状态边界：Factory 仅持有 Redis 客户端实例，不保存业务数据归属关系。
+// - 外部依赖：github.com/redis/go-redis/v9。
+// - 非职责：不负责具体业务 key 设计、数据权限隔离或跨实例幂等语义。
 package redis
 
 import (
@@ -59,13 +67,13 @@ func NewFactory(config *Config) *Factory {
 // NewRedisClient 创建Redis客户端
 func (f *Factory) NewRedisClient() *redis.Client {
 	return redis.NewClient(&redis.Options{
-		Addr:         fmt.Sprintf("%s:%d", f.config.Host, f.config.Port),
-		Password:     f.config.Password,
-		DB:           f.config.DB,
-		PoolSize:     f.config.PoolSize,
-		MinIdleConns: f.config.MinIdleConns,
-		MaxConnAge:   f.config.MaxConnAge,
-		IdleTimeout:  f.config.IdleTimeout,
+		Addr:            fmt.Sprintf("%s:%d", f.config.Host, f.config.Port),
+		Password:        f.config.Password,
+		DB:              f.config.DB,
+		PoolSize:        f.config.PoolSize,
+		MinIdleConns:    f.config.MinIdleConns,
+		ConnMaxLifetime: f.config.MaxConnAge,
+		ConnMaxIdleTime: f.config.IdleTimeout,
 	})
 }
 
@@ -103,4 +111,4 @@ func (f *Factory) Close() error {
 		return f.cache.Close()
 	}
 	return nil
-} 
+}

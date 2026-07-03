@@ -1,0 +1,12 @@
+redis:
+  host: "localhost"
+  port: 6379
+  pwd: ""
+mysql:
+  dsn: "mediahub_user:mediahub_password@tcp(localhost:3306)/mediahub?charset=utf8mb4&parseTime=True&loc=Local"
+  maxLifeTime: 3600
+  maxOpenConn: 10
+  maxIdleConn: 10
+log:
+  level: "info"
+  logPath: "runtime/logs/app.log"

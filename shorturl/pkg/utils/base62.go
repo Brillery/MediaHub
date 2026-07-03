@@ -1,3 +1,7 @@
+// Package utils 提供 shorturl 服务内部使用的基础编码和校验工具。
+//
+// Base62 编码以数据库自增 ID 为输入，输出对外暴露的短链 key；反解时如果遇到空值
+// 或非法字符，统一返回 0，交由上层按“非法短链”处理，避免负数 ID 继续进入缓存和数据库查询。
 package utils
 
 import "strings"
@@ -34,6 +38,9 @@ func ToBase10(str string) int64 {
 	var rs int64 = 0
 	for _, s := range str {
 		index := strings.IndexRune(chars, s)
+		if index < 0 {
+			return 0
+		}
 		rs = rs*62 + int64(index)
 	}
 	return rs

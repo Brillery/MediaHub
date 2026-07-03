@@ -1,9 +1,12 @@
+// Package redis 提供 Redis Cache 的基础读写接口实现。
+//
+// 本文件只封装单 key 的 get/set/delete/setnx 等原子操作，调用方仍需在业务层设计
+// key 前缀、租户/用户隔离、空值语义和失败降级策略。
 package redis
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -120,4 +123,4 @@ func (c *RedisCache) GetOrSet(ctx context.Context, key string, value interface{}
 // Close 关闭缓存连接
 func (c *RedisCache) Close() error {
 	return c.client.Close()
-} 
+}

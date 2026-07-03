@@ -1,0 +1,11 @@
+http:
+  ip: "0.0.0.0"
+  port: 9083
+  mode: "debug"
+log:
+  level: "info"
+  logPath: "runtime/logs/app.log"
+dependOn:
+  shortUrl:
+    address: "localhost:50051"
+    accessToken: "replace-with-internal-shorturl-token"
