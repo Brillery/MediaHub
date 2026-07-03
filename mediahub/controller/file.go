@@ -27,7 +27,6 @@ import (
 	_ "image/png"
 	"io"
 	"net/http"
-	"path"
 )
 
 /*
@@ -43,6 +42,15 @@ type Controller struct {
 	sf     storage.StorageFactory
 	log    log.ILogger
 	config *config.Config
+}
+
+// uploadImageMetadata 是上传链路识别出的图片格式元数据。
+//
+// Format 来自 image.DecodeConfig 对文件内容的识别结果，CanonicalExt 用于生成对象存储路径。
+// 这里不能信任用户上传文件名后缀，否则 JPEG 内容可以伪装成 .txt/.svg 并污染 CDN 元数据。
+type uploadImageMetadata struct {
+	Format       string
+	CanonicalExt string
 }
 
 const (
@@ -97,21 +105,6 @@ func (c *Controller) Upload(ctx *gin.Context) {
 	}
 	defer file.Close()
 
-	/*
-			io.Reader 代表一次性可读的数据流，数据被读取后，指针会前进，已经读取过的部分不会再保留。
-			Upload 方法中，你对 file 进行了两次读取
-			io.ReadAll(file) 已经把 file 的内容读取完，导致 isImage(file) 里的 image.DecodeConfig(file) 读取不到数据。
-			解决方案
-			1。使用 bytes.NewReader(content) 复用数据
-		content, _ := io.ReadAll(file) // ① 读取整个文件到内存
-		reader := bytes.NewReader(content) // ② 创建新的 Reader
-
-		if !isImage(reader) { // ③ 复用 Reader，不影响后续读取
-		    return
-		}
-
-	*/
-
 	content, err := io.ReadAll(file)
 	if err != nil {
 		c.log.Error(zerror.NewByErr(err))
@@ -119,28 +112,19 @@ func (c *Controller) Upload(ctx *gin.Context) {
 		return
 	}
 
-	// io.NopCloser 是 Go 标准库 io 包中的一个 适配器（adapter），它会 包装一个 io.Reader，
-	// 并为它提供一个 Close 方法，但 Close 方法 实际上什么都不做
-	// 接收一个 io.Reader，返回一个 io.ReadCloser
-	// 生成的 ReadCloser 不会真正关闭资源，只是提供了 Close() 方法，
-	//防止某些函数要求 io.ReadCloser 而 io.Reader 不能直接用的情况
-	if !IsImage(io.NopCloser(bytes.NewReader(content))) {
-		err = zerror.NewByMsg("仅支持jpg、png、gif格式")
+	// multipart 文件流只能顺序读一次；先读入受限大小的内存，再用新的 reader 分别做格式识别和对象上传。
+	imageMeta, ok := detectUploadImage(bytes.NewReader(content))
+	if !ok {
+		err = zerror.NewByMsg("仅支持jpg、png、gif、webp格式")
 		c.log.Error(err)
 		ctx.JSON(http.StatusBadRequest, gin.H{
-			"error": "仅支持jpg、png、gif格式",
+			"error": "仅支持jpg、png、gif、webp格式",
 		})
 		return
 	}
-	// bytes.NewReader(content) 生成的是 io.Reader，它没有 Close() 方法。
-	// io.NopCloser(...) 将 io.Reader 包装成 io.ReadCloser，这样 isImage 如果接收 io.ReadCloser，也能正常使用。
 
 	md5Digest := calMD5Digest(content)
-	filename := fmt.Sprintf("%x%s", md5Digest, path.Ext(fileHeader.Filename))
-	filePath := "/public/" + filename
-	if userId != 0 {
-		filePath = fmt.Sprintf("/%d/%s", userId, filename)
-	}
+	filePath := buildUploadFilePath(userId, md5Digest, imageMeta)
 
 	s := c.sf.CreateStorage()
 	url, err := s.Upload(io.NopCloser(bytes.NewReader(content)), md5Digest, filePath)
@@ -190,42 +174,42 @@ func (c *Controller) Upload(ctx *gin.Context) {
 	})
 }
 
-//func isImage(r io.Reader) bool {
-//	// 第一次读取，已经把 file 的内容读取完，导致 isImage(file) 里的 image.DecodeConfig(file) 读取不到数据。
-//	content, err := io.ReadAll(r)
-//	if err != nil {
-//		fmt.Println("ReadAll error:", err)
-//		return false
-//	}
+// detectUploadImage 只根据文件内容识别支持的图片格式。
 //
-//	_, format, err := image.DecodeConfig(bytes.NewReader(content))
-//	if err != nil {
-//		fmt.Println("DecodeConfig error:", err)
-//		fmt.Println("File header (first 20 bytes):", content[:20]) // 打印文件头
-//		return false
-//	}
-//
-//	fmt.Println("Detected format:", format)
-//
-//	switch format {
-//	case "jpeg", "png", "gif":
-//		return true
-//	default:
-//		return false
-//	}
-//}
-
-func IsImage(r io.Reader) bool {
+// 用户上传的 filename 和 Content-Type 都可以伪造，所以上传路径和存储元数据必须以 DecodeConfig 的结果为准。
+func detectUploadImage(r io.Reader) (uploadImageMetadata, bool) {
 	_, format, err := image.DecodeConfig(r)
 	if err != nil {
-		return false
+		return uploadImageMetadata{}, false
 	}
 	switch format {
-	case "jpeg", "png", "gif", "webp":
-		return true
+	case "jpeg":
+		return uploadImageMetadata{Format: format, CanonicalExt: ".jpg"}, true
+	case "png", "gif", "webp":
+		return uploadImageMetadata{Format: format, CanonicalExt: "." + format}, true
 	default:
-		return false
+		return uploadImageMetadata{}, false
 	}
+}
+
+// IsImage 保留给旧测试和潜在内部调用使用。
+//
+// 新上传链路应优先使用 detectUploadImage，避免只拿到 true/false 后又回退到不可信文件名后缀。
+func IsImage(r io.Reader) bool {
+	_, ok := detectUploadImage(r)
+	return ok
+}
+
+// buildUploadFilePath 根据鉴权用户和图片真实格式生成对象存储路径。
+//
+// userID 为 0 代表公共资源，写入 /public；非 0 用户写入自己的用户目录。
+// 路径中的扩展名必须来自服务端内容识别结果，不能来自用户提交的文件名。
+func buildUploadFilePath(userID int64, md5Digest []byte, imageMeta uploadImageMetadata) string {
+	filename := fmt.Sprintf("%x%s", md5Digest, imageMeta.CanonicalExt)
+	if userID != 0 {
+		return fmt.Sprintf("/%d/%s", userID, filename)
+	}
+	return "/public/" + filename
 }
 
 func calMD5Digest(msg []byte) []byte {

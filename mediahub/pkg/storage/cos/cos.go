@@ -1,3 +1,7 @@
+// Package cos 实现 MediaHub 图片上传到腾讯云 COS 的对象存储适配器。
+//
+// 输入来自 controller 层已经校验过的图片流、MD5 和对象路径；输出是 COS 或 CDN 访问 URL。
+// 本模块只负责对象写入和存储元数据，不负责请求鉴权、图片解码、短链生成或上传记录持久化。
 package cos
 
 import (
@@ -17,6 +21,18 @@ type cosStorageFactory struct {
 	secretId  string
 	secretKey string
 	cdnDomain string
+}
+
+// supportedObjectContentTypes 是 COS 对象 Content-Type 的服务端白名单。
+//
+// 扩展名通常来自上传控制器基于图片内容生成的规范路径；这里仍做兜底，
+// 避免未来调用方传入未知扩展时写出 image/svg 这类未经允许的元数据。
+var supportedObjectContentTypes = map[string]string{
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".gif":  "image/gif",
+	".webp": "image/webp",
 }
 
 func NewCosStorageFactory(bucketUrl, secretId, secretKey, cdnDomain string) storage.StorageFactory {
@@ -96,9 +112,8 @@ func (s *cosStorage) Upload(r io.Reader, md5Digest []byte, dstPath string) (url 
 }
 
 func (s *cosStorage) getContentType(dstPath string) string {
-	ext := strings.Trim(path.Ext(dstPath), ".")
-	if ext == "jpg" {
-		ext = "jpeg"
+	if contentType, ok := supportedObjectContentTypes[strings.ToLower(path.Ext(dstPath))]; ok {
+		return contentType
 	}
-	return "image/" + ext
+	return "application/octet-stream"
 }

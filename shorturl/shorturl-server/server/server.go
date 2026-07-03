@@ -1,3 +1,10 @@
+// Package server 承载 shorturl gRPC 服务的核心业务编排。
+//
+// 本模块负责在短链生成、短链解析、Redis 缓存、布隆过滤器、分布式锁和 MySQL 数据访问之间做请求级协调。
+// 输入来自 gRPC proto 请求；输出是 proto.Url 或明确错误。
+// 状态边界：短链持久化状态归 data 层维护，缓存状态归 cache 层维护，本模块只决定何时读取、回填和降级。
+// 并发边界：缓存击穿通过分布式锁收敛，同一个短链 key 在多实例并发 miss 时只允许一个请求优先回源；锁失败时允许直接回源兜底，保证可用性优先。
+// 本模块不负责 HTTP 路由、不负责鉴权拦截器、不负责定时刷新 max_id，也不直接操作 Redis/MySQL SDK。
 package server
 
 import (
@@ -14,6 +21,18 @@ import (
 	"shorturl/shorturl-server/data"
 	"strconv"
 	"time"
+)
+
+const (
+	// negativeCacheValue 是短链不存在时写入 Redis 的空值哨兵。
+	//
+	// 不能用空字符串表示“不存在”：KVCache.Get 返回空字符串也代表缓存未命中，两者混在一起会导致空值缓存永远不生效。
+	negativeCacheValue = "__mediahub_shorturl_not_found__"
+
+	// negativeCacheTTLSeconds 是空值缓存的短过期时间。
+	//
+	// 该值只用于抵挡不存在短码的重复访问，不应该像正常短链缓存一样保存 30 天，避免后续补数据后长时间不可见。
+	negativeCacheTTLSeconds = 60
 )
 
 // shortUrlService 实现了 proto.ShortUrlServer 接口，提供短链接相关服务。
@@ -140,7 +159,7 @@ func (s *shortUrlService) GetShortUrl(ctx context.Context, in *proto.Url) (*prot
 	key := keyPrefix + entity.ShortKey
 
 	// 使用随机过期时间，避免缓存雪崩
-	ttl := cache.DefaultTTL*80/100 + rand.Intn(cache.DefaultTTL*40/100)
+	ttl := randomShortURLCacheTTL()
 	err = kvCache.Set(key, entity.OriginalUrl, ttl)
 	if err != nil {
 		s.log.Error(zerror.NewByErr(err))
@@ -217,6 +236,11 @@ func (s *shortUrlService) GetOriginalUrl(ctx context.Context, in *proto.ShortKey
 		s.log.Error(err)
 		return nil, zerror.NewByErr(err)
 	}
+	if originalUrl == negativeCacheValue {
+		err := zerror.NewByMsg("短链不存在")
+		s.log.Error(err)
+		return nil, err
+	}
 
 	// 如果缓存未命中，从数据库获取原始URL
 	if originalUrl == "" {
@@ -253,85 +277,9 @@ func (s *shortUrlService) GetOriginalUrl(ctx context.Context, in *proto.ShortKey
 			return nil, err
 		}
 
-		// 使用分布式锁防止缓存击穿
-		lockKey := "lock:" + key
-		lock := s.lockFactory.NewDistributedLock()
-		locked, err := lock.Lock(lockKey, 5*time.Second)
+		originalUrl, err = s.resolveOriginalURLOnCacheMiss(id, key, kvCache, d)
 		if err != nil {
-			s.log.Warning("获取分布式锁失败: " + err.Error())
-		} else if locked {
-			defer lock.Unlock(lockKey)
-
-			// 再次检查缓存，可能在获取锁的过程中其他请求已经更新了缓存
-			originalUrl, err = kvCache.Get(key)
-			if err != nil {
-				s.log.Error(err)
-				return nil, zerror.NewByErr(err)
-			}
-
-			if originalUrl == "" {
-				// 从数据库获取原始URL
-				entity, err := d.GetByID(id)
-				if err != nil {
-					s.log.Error(err)
-					return nil, zerror.NewByErr(err)
-				}
-
-				if entity == nil {
-					// 数据库中也找不到，缓存空值防止缓存穿透
-					originalUrl = ""
-					// 使用较短的过期时间缓存空值
-					err = kvCache.Set(key, "", 60)
-					if err != nil {
-						s.log.Warning("缓存空值失败: " + err.Error())
-					}
-				} else {
-					originalUrl = entity.OriginalUrl
-					// 使用随机过期时间，避免缓存雪崩
-					ttl := cache.DefaultTTL*80/100 + rand.Intn(cache.DefaultTTL*40/100)
-					err = kvCache.Set(key, originalUrl, ttl)
-					if err != nil {
-						s.log.Error(err)
-						return nil, zerror.NewByErr(err)
-					}
-				}
-			}
-		} else {
-			// 未能获取锁，等待一段时间后重试
-			time.Sleep(100 * time.Millisecond)
-			originalUrl, err = kvCache.Get(key)
-			if err != nil {
-				s.log.Error(err)
-				return nil, zerror.NewByErr(err)
-			}
-
-			if originalUrl == "" {
-				// 仍然未命中，从数据库获取
-				entity, err := d.GetByID(id)
-				if err != nil {
-					s.log.Error(err)
-					return nil, zerror.NewByErr(err)
-				}
-
-				if entity == nil {
-					// 数据库中也找不到，缓存空值防止缓存穿透
-					originalUrl = ""
-					// 使用较短的过期时间缓存空值
-					err = kvCache.Set(key, "", 60)
-					if err != nil {
-						s.log.Warning("缓存空值失败: " + err.Error())
-					}
-				} else {
-					originalUrl = entity.OriginalUrl
-					// 使用随机过期时间，避免缓存雪崩
-					ttl := cache.DefaultTTL*80/100 + rand.Intn(cache.DefaultTTL*40/100)
-					err = kvCache.Set(key, originalUrl, ttl)
-					if err != nil {
-						s.log.Error(err)
-						return nil, zerror.NewByErr(err)
-					}
-				}
-			}
+			return nil, err
 		}
 	}
 
@@ -346,6 +294,76 @@ func (s *shortUrlService) GetOriginalUrl(ctx context.Context, in *proto.ShortKey
 		Url:    originalUrl,
 		UserID: in.UserID,
 	}, nil
+}
+
+// resolveOriginalURLOnCacheMiss 处理短链缓存未命中后的回源流程。
+//
+// 多实例并发访问同一短链时，优先用分布式锁收敛 DB 回源；拿不到锁的请求短暂等待后再读缓存。
+// 如果锁服务异常，为了避免 Redis 锁故障放大成短链不可用，这里允许直接回源并回填缓存。
+func (s *shortUrlService) resolveOriginalURLOnCacheMiss(id int64, key string, kvCache cache.KVCache, d data.IUrlMapData) (string, error) {
+	lockKey := "lock:" + key
+	lock := s.lockFactory.NewDistributedLock()
+	locked, err := lock.Lock(lockKey, 5*time.Second)
+	if err != nil {
+		s.log.Warning("获取分布式锁失败，降级直接回源: " + err.Error())
+		return s.loadOriginalURLFromDB(id, key, kvCache, d)
+	}
+	if locked {
+		defer lock.Unlock(lockKey)
+
+		// 获锁后必须再读一次缓存：等待锁期间可能已有其他实例完成回源并回填。
+		originalURL, err := kvCache.Get(key)
+		if err != nil {
+			s.log.Error(err)
+			return "", zerror.NewByErr(err)
+		}
+		if originalURL == negativeCacheValue {
+			return "", zerror.NewByMsg("短链不存在")
+		}
+		if originalURL != "" {
+			return originalURL, nil
+		}
+		return s.loadOriginalURLFromDB(id, key, kvCache, d)
+	}
+
+	// 未抢到锁时先给持锁实例一点回填时间；仍未命中再直接回源，避免请求长时间挂住。
+	time.Sleep(100 * time.Millisecond)
+	originalURL, err := kvCache.Get(key)
+	if err != nil {
+		s.log.Error(err)
+		return "", zerror.NewByErr(err)
+	}
+	if originalURL == negativeCacheValue {
+		return "", zerror.NewByMsg("短链不存在")
+	}
+	if originalURL != "" {
+		return originalURL, nil
+	}
+	return s.loadOriginalURLFromDB(id, key, kvCache, d)
+}
+
+// loadOriginalURLFromDB 从 MySQL 回源并写入 Redis 缓存。
+//
+// 数据库未命中时写入短期空值哨兵，解决缓存穿透；数据库命中时写入带随机过期时间的正常缓存，降低雪崩概率。
+func (s *shortUrlService) loadOriginalURLFromDB(id int64, key string, kvCache cache.KVCache, d data.IUrlMapData) (string, error) {
+	entity, err := d.GetByID(id)
+	if err != nil {
+		s.log.Error(err)
+		return "", zerror.NewByErr(err)
+	}
+	if entity == nil {
+		if err := kvCache.Set(key, negativeCacheValue, negativeCacheTTLSeconds); err != nil {
+			s.log.Warning("缓存空值失败: " + err.Error())
+		}
+		return "", zerror.NewByMsg("短链不存在")
+	}
+
+	originalURL := entity.OriginalUrl
+	if err := kvCache.Set(key, originalURL, randomShortURLCacheTTL()); err != nil {
+		s.log.Error(err)
+		return "", zerror.NewByErr(err)
+	}
+	return originalURL, nil
 }
 
 // idFilter 验证短链ID是否合法
@@ -366,7 +384,6 @@ func (s *shortUrlService) idFilter(id int64, kvCache cache.KVCache, isPublic boo
 	}
 
 	idStr, err := kvCache.Get(key)
-	fmt.Printf("缓存键: %s, 缓存中的最大ID: %s, 当前请求ID: %d\n", key, idStr, id)
 
 	if err != nil {
 		s.log.Error(err)
@@ -381,6 +398,10 @@ func (s *shortUrlService) idFilter(id int64, kvCache cache.KVCache, isPublic boo
 			s.log.Error(err)
 			return err
 		}
+	} else {
+		// max_id 由独立 crontab 写入，服务刚启动、Redis 过期或定时任务延迟时可能暂时缺失。
+		// 这里不能直接判定短链非法，必须放行到 DB 回源，否则会把合法短链误判成 404。
+		return nil
 	}
 
 	// 验证传入ID是否小于等于当前最大合法ID
@@ -390,4 +411,11 @@ func (s *shortUrlService) idFilter(id int64, kvCache cache.KVCache, isPublic boo
 		return err
 	}
 	return nil
+}
+
+// randomShortURLCacheTTL 返回带随机抖动的正常短链缓存 TTL。
+//
+// 多个短链如果同一秒批量写入缓存，固定过期时间会造成集中失效；抖动可以降低缓存雪崩概率。
+func randomShortURLCacheTTL() int {
+	return cache.DefaultTTL*80/100 + rand.Intn(cache.DefaultTTL*40/100)
 }
