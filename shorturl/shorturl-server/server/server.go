@@ -9,6 +9,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"math/rand"
 	"shorturl/pkg/config"
@@ -121,28 +122,10 @@ func (s *shortUrlService) GetShortUrl(ctx context.Context, in *proto.Url) (*prot
 
 	// 根据是否为公共链接创建数据访问对象
 	d := s.urlMapDataFactory.NewUrlMapData(isPublic)
-	entity, err := d.GetByOriginal(in.Url)
+	entity, err := s.getOrCreateURLMapping(in, isPublic, d)
 	if err != nil {
 		s.log.Error(zerror.NewByErr(err))
 		return nil, err
-	}
-
-	// 生成新的短链接标识符（若未存在）
-	if entity.ShortKey == "" {
-		id, err := d.GenerateID(in.GetUserID(), time.Now().Unix())
-		if err != nil {
-			s.log.Error(zerror.NewByErr(err))
-			return nil, err
-		}
-		entity.ShortKey = utils.ToBase62(id)
-		entity.OriginalUrl = in.Url
-		entity.ID = id
-		entity.UpdateAt = time.Now().Unix()
-		err = d.Update(entity)
-		if err != nil {
-			s.log.Error(zerror.NewByErr(err))
-			return nil, err
-		}
 	}
 
 	// 根据链接类型配置域名和缓存键前缀
@@ -180,6 +163,99 @@ func (s *shortUrlService) GetShortUrl(ctx context.Context, in *proto.Url) (*prot
 		Url:    domain + entity.ShortKey,
 		UserID: in.UserID,
 	}, nil
+}
+
+// getOrCreateURLMapping 获取或创建原始 URL 对应的短链映射。
+//
+// 并发边界：首次查询未命中后，必须按原始 URL 获取分布式锁并在锁内二次查询。
+// 这样多实例同时为同一个 URL 生成短链时，只有第一个请求会真正写入，其余请求会复用锁内已出现的记录。
+func (s *shortUrlService) getOrCreateURLMapping(in *proto.Url, isPublic bool, d data.IUrlMapData) (data.UrlMapEntity, error) {
+	entity, err := d.GetByOriginal(in.Url)
+	if err != nil {
+		return entity, err
+	}
+	if entity.ShortKey != "" {
+		return entity, nil
+	}
+	return s.createURLMappingWithOriginalLock(in, isPublic, d)
+}
+
+// createURLMappingWithOriginalLock 在原始 URL 维度收敛短链创建。
+//
+// lock key 使用 SHA-256 摘要而不是原始 URL，避免把用户 URL 明文写入 Redis key。
+// 如果锁服务异常，为了不让 Redis 锁故障阻断上传主链路，降级为直接创建；该降级仍可能产生重复记录，后续唯一索引迁移会进一步兜住。
+func (s *shortUrlService) createURLMappingWithOriginalLock(in *proto.Url, isPublic bool, d data.IUrlMapData) (data.UrlMapEntity, error) {
+	if s.lockFactory == nil {
+		return s.createURLMappingDirect(in, d)
+	}
+
+	lockKey := originalURLCreationLockKey(isPublic, in.GetUserID(), in.Url)
+	lock := s.lockFactory.NewDistributedLock()
+	locked, err := lock.Lock(lockKey, 5*time.Second)
+	if err != nil {
+		s.log.Warning("获取短链创建锁失败，降级直接创建: " + err.Error())
+		return s.createURLMappingDirect(in, d)
+	}
+	if locked {
+		defer lock.Unlock(lockKey)
+
+		// 获锁后必须二次查询：等待锁期间可能已有其他实例完成创建。
+		entity, err := d.GetByOriginal(in.Url)
+		if err != nil {
+			return entity, err
+		}
+		if entity.ShortKey != "" {
+			return entity, nil
+		}
+		return s.createURLMappingDirect(in, d)
+	}
+
+	// 未抢到锁时短暂等待持锁实例写入；仍未出现映射则直接创建，避免请求长期阻塞。
+	time.Sleep(100 * time.Millisecond)
+	entity, err := d.GetByOriginal(in.Url)
+	if err != nil {
+		return entity, err
+	}
+	if entity.ShortKey != "" {
+		return entity, nil
+	}
+	return s.createURLMappingDirect(in, d)
+}
+
+// createURLMappingDirect 执行短链记录创建。
+//
+// 本函数只负责“生成 ID -> 计算 short key -> 回写记录”这条最小写入路径。
+// 调用方负责在需要时先做原始 URL 维度的并发收敛。
+func (s *shortUrlService) createURLMappingDirect(in *proto.Url, d data.IUrlMapData) (data.UrlMapEntity, error) {
+	now := time.Now().Unix()
+	id, err := d.GenerateID(in.GetUserID(), now)
+	if err != nil {
+		return data.UrlMapEntity{}, err
+	}
+
+	entity := data.UrlMapEntity{
+		ID:          id,
+		UserID:      in.GetUserID(),
+		ShortKey:    utils.ToBase62(id),
+		OriginalUrl: in.Url,
+		UpdateAt:    now,
+	}
+	if err := d.Update(entity); err != nil {
+		return data.UrlMapEntity{}, err
+	}
+	return entity, nil
+}
+
+// originalURLCreationLockKey 生成原始 URL 维度的短链创建锁 key。
+//
+// public 和 user 短链使用不同表，锁的冲突域也必须分开；私有短链还需要带 userID，避免不同用户的同一原始 URL 互相阻塞。
+func originalURLCreationLockKey(isPublic bool, userID int64, originalURL string) string {
+	scope := "public"
+	if !isPublic {
+		scope = fmt.Sprintf("user:%d", userID)
+	}
+	digest := sha256.Sum256([]byte(originalURL))
+	return fmt.Sprintf("shorturl:create:%s:%x", scope, digest)
 }
 
 // GetOriginalUrl 根据短链接键获取原始URL
