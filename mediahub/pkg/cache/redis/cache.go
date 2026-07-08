@@ -30,6 +30,17 @@ type Cache interface {
 	Close() error
 }
 
+// compareAndDeleteScript 是 Redis 锁释放脚本。
+//
+// KEYS[1] 是锁 key，ARGV[1] 是当前请求持有的 token；只有二者匹配时才删除，
+// 避免旧请求在锁过期后误删下一轮请求重新获得的锁。
+const compareAndDeleteScript = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+end
+return 0
+`
+
 // RedisCache 是Cache接口的Redis实现
 type RedisCache struct {
 	client *redis.Client
@@ -73,6 +84,18 @@ func (c *RedisCache) Set(ctx context.Context, key string, value interface{}, ttl
 // Delete 删除缓存
 func (c *RedisCache) Delete(ctx context.Context, key string) error {
 	return c.client.Del(ctx, key).Err()
+}
+
+// CompareAndDelete 仅当当前值等于 expected 时删除 key。
+//
+// 该方法用于释放缓存击穿锁：GET 和 DEL 必须在 Redis 内原子完成，避免锁过期后
+// 旧请求把新请求刚抢到的锁删掉。返回值表示本次是否真正删除了 key。
+func (c *RedisCache) CompareAndDelete(ctx context.Context, key string, expected string) (bool, error) {
+	deleted, err := c.client.Eval(ctx, compareAndDeleteScript, []string{key}, expected).Int()
+	if err != nil {
+		return false, err
+	}
+	return deleted > 0, nil
 }
 
 // Exists 检查缓存是否存在

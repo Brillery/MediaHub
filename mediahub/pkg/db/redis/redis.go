@@ -92,7 +92,7 @@ func (cs *CacheService) GetWithCachePenetration(ctx context.Context, key string,
 		// 缓存命中
 		return val, nil
 	}
-	
+
 	// 2. 缓存未命中，检查是否是空值缓存
 	if err == redis.Nil {
 		// 检查是否存在空值标记
@@ -103,20 +103,20 @@ func (cs *CacheService) GetWithCachePenetration(ctx context.Context, key string,
 			return nil, nil
 		}
 	}
-	
+
 	// 3. 从数据库获取数据
 	data, err := fetchFunc()
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// 4. 如果数据不存在，设置空值缓存
 	if data == nil {
 		// 设置空值标记，过期时间比正常数据短
 		cs.client.Set(ctx, key+":empty", "", ttl/2)
 		return nil, nil
 	}
-	
+
 	// 5. 数据存在，设置缓存
 	cs.client.Set(ctx, key, data, ttl)
 	return data, nil
@@ -133,44 +133,42 @@ func (cs *CacheService) GetWithCacheBreakdown(ctx context.Context, key string, t
 		// 缓存命中
 		return val, nil
 	}
-	
+
 	// 2. 缓存未命中，尝试获取锁
 	lockKey := key + ":lock"
-	// 使用SETNX命令尝试获取锁，设置锁的过期时间为10秒
-	locked, err := cs.client.SetNX(ctx, lockKey, "1", 10*time.Second).Result()
+	lockToken := newRedisLockToken()
+	// 锁值必须是当前请求唯一 token，释放时才能判断锁是否仍归自己持有。
+	locked, err := cs.client.SetNX(ctx, lockKey, lockToken, 10*time.Second).Result()
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if !locked {
 		// 获取锁失败，说明其他协程正在更新缓存
 		// 等待一段时间后重试
 		time.Sleep(100 * time.Millisecond)
 		return cs.GetWithCacheBreakdown(ctx, key, ttl, fetchFunc)
 	}
-	
+
+	// 获取锁成功后统一按 token 释放，避免锁过期后误删下一轮请求的锁。
+	defer releaseRedisLock(ctx, cs.client, lockKey, lockToken)
+
 	// 3. 获取锁成功，再次检查缓存（双重检查）
 	val, err = cs.client.Get(ctx, key).Result()
 	if err == nil {
-		// 缓存已更新，释放锁并返回
-		cs.client.Del(ctx, lockKey)
+		// 缓存已被其他请求更新，当前请求只返回缓存值，不再重复查询数据源。
 		return val, nil
 	}
-	
+
 	// 4. 从数据库获取数据
 	data, err := fetchFunc()
 	if err != nil {
-		// 释放锁
-		cs.client.Del(ctx, lockKey)
 		return nil, err
 	}
-	
+
 	// 5. 设置缓存
 	cs.client.Set(ctx, key, data, ttl)
-	
-	// 6. 释放锁
-	cs.client.Del(ctx, lockKey)
-	
+
 	return data, nil
 }
 
@@ -185,19 +183,19 @@ func (cs *CacheService) GetWithCacheAvalanche(ctx context.Context, key string, b
 		// 缓存命中
 		return val, nil
 	}
-	
+
 	// 2. 缓存未命中，从数据库获取数据
 	data, err := fetchFunc()
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// 3. 设置缓存，使用随机过期时间
 	// 在基础过期时间的基础上，随机增加或减少最多10%的时间
 	// 这样可以避免大量缓存同时过期
 	randomFactor := 0.9 + 0.2*rand.Float64() // 0.9到1.1之间的随机数
 	randomTTL := time.Duration(float64(baseTTL) * randomFactor)
-	
+
 	cs.client.Set(ctx, key, data, randomTTL)
 	return data, nil
 }
@@ -213,7 +211,7 @@ func (cs *CacheService) GetWithAllProtections(ctx context.Context, key string, b
 		// 缓存命中
 		return val, nil
 	}
-	
+
 	// 2. 缓存未命中，检查是否是空值缓存
 	if err == redis.Nil {
 		// 检查是否存在空值标记
@@ -224,55 +222,51 @@ func (cs *CacheService) GetWithAllProtections(ctx context.Context, key string, b
 			return nil, nil
 		}
 	}
-	
+
 	// 3. 尝试获取锁
 	lockKey := key + ":lock"
-	// 使用SETNX命令尝试获取锁，设置锁的过期时间为10秒
-	locked, err := cs.client.SetNX(ctx, lockKey, "1", 10*time.Second).Result()
+	lockToken := newRedisLockToken()
+	// 锁值必须是当前请求唯一 token，释放时才能判断锁是否仍归自己持有。
+	locked, err := cs.client.SetNX(ctx, lockKey, lockToken, 10*time.Second).Result()
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if !locked {
 		// 获取锁失败，说明其他协程正在更新缓存
 		// 等待一段时间后重试
 		time.Sleep(100 * time.Millisecond)
 		return cs.GetWithAllProtections(ctx, key, baseTTL, fetchFunc)
 	}
-	
+
+	// 获取锁成功后统一按 token 释放，避免锁过期后误删下一轮请求的锁。
+	defer releaseRedisLock(ctx, cs.client, lockKey, lockToken)
+
 	// 4. 获取锁成功，再次检查缓存（双重检查）
 	val, err = cs.client.Get(ctx, key).Result()
 	if err == nil {
-		// 缓存已更新，释放锁并返回
-		cs.client.Del(ctx, lockKey)
+		// 缓存已被其他请求更新，当前请求只返回缓存值，不再重复查询数据源。
 		return val, nil
 	}
-	
+
 	// 5. 从数据库获取数据
 	data, err := fetchFunc()
 	if err != nil {
-		// 释放锁
-		cs.client.Del(ctx, lockKey)
 		return nil, err
 	}
-	
+
 	// 6. 如果数据不存在，设置空值缓存
 	if data == nil {
 		// 设置空值标记，过期时间比正常数据短
 		cs.client.Set(ctx, key+":empty", "", baseTTL/2)
-		// 释放锁
-		cs.client.Del(ctx, lockKey)
 		return nil, nil
 	}
-	
+
 	// 7. 设置缓存，使用随机过期时间
 	randomFactor := 0.9 + 0.2*rand.Float64() // 0.9到1.1之间的随机数
 	randomTTL := time.Duration(float64(baseTTL) * randomFactor)
-	
+
 	cs.client.Set(ctx, key, data, randomTTL)
-	
-	// 8. 释放锁
-	cs.client.Del(ctx, lockKey)
-	
+
 	return data, nil
 }

@@ -140,7 +140,8 @@ func (s *BreakdownStrategy) Get(ctx context.Context, key string, fetchFunc func(
 
 	// 尝试获取锁
 	lockKey := key + ":lock"
-	locked, err := s.cache.SetNX(ctx, lockKey, "1", 10*time.Second)
+	lockToken := newCacheLockToken()
+	locked, err := s.cache.SetNX(ctx, lockKey, lockToken, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -152,24 +153,22 @@ func (s *BreakdownStrategy) Get(ctx context.Context, key string, fetchFunc func(
 		return s.Get(ctx, key, fetchFunc, ttl)
 	}
 
+	// 获取锁成功后统一用 token 释放，避免锁过期后误删下一轮 worker 的锁。
+	defer releaseCacheLock(ctx, s.cache, lockKey, lockToken)
+
 	// 获取锁成功，再次检查缓存（双重检查）
 	val, err = s.cache.Get(ctx, key)
 	if err != nil {
-		// 释放锁
-		s.cache.Delete(ctx, lockKey)
 		return nil, err
 	}
 	if val != nil {
-		// 缓存已更新，释放锁并返回
-		s.cache.Delete(ctx, lockKey)
+		// 缓存已被其他请求更新，当前请求只返回缓存值，不再重复查询数据源。
 		return val, nil
 	}
 
 	// 从数据源获取
 	data, err := fetchFunc()
 	if err != nil {
-		// 释放锁
-		s.cache.Delete(ctx, lockKey)
 		return nil, err
 	}
 
@@ -177,14 +176,9 @@ func (s *BreakdownStrategy) Get(ctx context.Context, key string, fetchFunc func(
 	if data != nil {
 		err = s.cache.Set(ctx, key, data, ttl)
 		if err != nil {
-			// 释放锁
-			s.cache.Delete(ctx, lockKey)
 			return nil, err
 		}
 	}
-
-	// 释放锁
-	s.cache.Delete(ctx, lockKey)
 
 	return data, nil
 }
@@ -269,7 +263,8 @@ func (s *AllProtectionsStrategy) Get(ctx context.Context, key string, fetchFunc 
 
 	// 尝试获取锁
 	lockKey := key + ":lock"
-	locked, err := s.cache.SetNX(ctx, lockKey, "1", 10*time.Second)
+	lockToken := newCacheLockToken()
+	locked, err := s.cache.SetNX(ctx, lockKey, lockToken, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -281,24 +276,22 @@ func (s *AllProtectionsStrategy) Get(ctx context.Context, key string, fetchFunc 
 		return s.Get(ctx, key, fetchFunc, ttl)
 	}
 
+	// 获取锁成功后统一用 token 释放，避免锁过期后误删下一轮 worker 的锁。
+	defer releaseCacheLock(ctx, s.cache, lockKey, lockToken)
+
 	// 获取锁成功，再次检查缓存（双重检查）
 	val, err = s.cache.Get(ctx, key)
 	if err != nil {
-		// 释放锁
-		s.cache.Delete(ctx, lockKey)
 		return nil, err
 	}
 	if val != nil {
-		// 缓存已更新，释放锁并返回
-		s.cache.Delete(ctx, lockKey)
+		// 缓存已被其他请求更新，当前请求只返回缓存值，不再重复查询数据源。
 		return val, nil
 	}
 
 	// 从数据源获取
 	data, err := fetchFunc()
 	if err != nil {
-		// 释放锁
-		s.cache.Delete(ctx, lockKey)
 		return nil, err
 	}
 
@@ -307,12 +300,8 @@ func (s *AllProtectionsStrategy) Get(ctx context.Context, key string, fetchFunc 
 		// 设置空值标记，过期时间比正常数据短
 		err = s.cache.Set(ctx, emptyKey, "", ttl/2)
 		if err != nil {
-			// 释放锁
-			s.cache.Delete(ctx, lockKey)
 			return nil, err
 		}
-		// 释放锁
-		s.cache.Delete(ctx, lockKey)
 		return nil, nil
 	}
 
@@ -322,13 +311,8 @@ func (s *AllProtectionsStrategy) Get(ctx context.Context, key string, fetchFunc 
 
 	err = s.cache.Set(ctx, key, data, randomTTL)
 	if err != nil {
-		// 释放锁
-		s.cache.Delete(ctx, lockKey)
 		return nil, err
 	}
-
-	// 释放锁
-	s.cache.Delete(ctx, lockKey)
 
 	return data, nil
 }
