@@ -21,14 +21,12 @@ class homeRes{
 }
 
 onBeforeMount(() => {
-    console.log("on before mount")
     home<homeRes>().then(function(res){
-        console.log(res.data)
         data.banners.value = res.data?.banners ||["","",""] 
         data.imgs1.value = res.data?.images1||["","","","",""] 
         data.imgs2.value = res.data?.images2||["","","","",""] 
-    }).catch(function(res){
-        console.log(res)
+    }).catch(function(){
+        // 首页素材是非阻断配置，接口失败时保留占位数据，避免首屏渲染被空配置拖垮。
     })
 })
 

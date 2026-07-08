@@ -29,7 +29,6 @@ service.interceptors.response.use(function (response) {
     // 超出 2xx 范围的状态码都会触发该函数。
     // 对响应错误做点什么
     const axiosErr = error as AxiosError 
-    //    console.log(axiosErr.response?.status)
     if (!axiosErr.response?.status) {
         ElMessage({
             showClose: true,
@@ -56,9 +55,6 @@ service.interceptors.response.use(function (response) {
             type: 'error',
         })
     }
-
-    console.log(axiosErr.message)
-    console.log(axiosErr.response?.status)
 
     return Promise.reject(error);
   });

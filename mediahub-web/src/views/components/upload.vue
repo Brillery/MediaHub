@@ -32,7 +32,6 @@ class fileUploadRes{
 }
 
 function handleUpload() {
-    console.log("handleUpload")
     const input = document.createElement('input')
     input.type = "file"
     input.id = "file-upload"
@@ -49,8 +48,9 @@ function handleUpload() {
             formData.append("file", files[0])
             uploadFile<fileUploadRes>({formData:formData}).then(function(res){
                 data.url.value = res.data?.url??"" 
-            }).catch(function(res){
-                console.log(res.message)
+            }).catch(function(){
+                // 上传失败通常已经由 axios 拦截器提示具体状态，这里补一个业务动作级兜底。
+                ElMessage.error("上传失败，请稍后重试")
             }).finally(function(){
                 loading.close()
             })
