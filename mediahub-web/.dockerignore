@@ -1,2 +1,7 @@
 node_modules
 .vscode
+dist
+dist-ssr
+.env
+.env.*
+*.local
