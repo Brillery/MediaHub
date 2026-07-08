@@ -18,6 +18,15 @@ If the standalone TypeScript plugin doesn't feel fast enough to you, Volar has a
 2. Reload the VSCode window by running `Developer: Reload Window` from the command palette.
 
 # 前端部署
+## 构建并同步到 Go 内置静态目录
+后端 `mediahub` 会直接托管 `mediahub/www`。修改前端后，如果要让 Go 服务内置页面同步更新，执行：
+
+```
+npm run build:embedded
+```
+
+该命令会先执行 Vite 构建，再把 `dist` 覆盖同步到 `../mediahub/www`，避免旧 hash 资源残留。
+
 ## 镜像构建
 ```
 docker build -t mediahub-web:0.1.0 .

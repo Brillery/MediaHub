@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc && vite build",
+    "build:embedded": "npm run build && npm run sync:embedded-www",
+    "sync:embedded-www": "node scripts/sync-embedded-www.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
