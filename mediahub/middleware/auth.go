@@ -5,15 +5,17 @@
 package middleware
 
 import (
+	"context"
 	"encoding/json"
 	"enterprise-project1-mediahub/mediahub/pkg/config"
 	"enterprise-project1-mediahub/mediahub/pkg/log"
-	"enterprise-project1-mediahub/mediahub/pkg/zerror"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 )
 
 const (
@@ -26,6 +28,7 @@ const (
 	AuthUserAvatarURLKey = "avatar_url"
 )
 
+// Auth 允许无凭证的匿名上传；携带凭证时必须得到有效用户，失败不得退回公共目录。
 func Auth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := strings.TrimPrefix(c.Request.Header.Get("Authorization"), "Bearer ")
@@ -33,7 +36,7 @@ func Auth() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		user, err := checkAuth(token)
+		user, err := checkAuth(c.Request.Context(), token)
 		if err != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			log.Error(err)
@@ -50,56 +53,69 @@ func Auth() gin.HandlerFunc {
 	}
 }
 
+// userInfo 是用户中心成功响应；ID 必须大于 0，名称和头像仅用于展示。
 type userInfo struct {
 	ID        int64  `json:"id"`
 	Name      string `json:"name"`
 	AvatarUrl string `json:"avatar_url"`
 }
 
-var httpClient = &http.Client{}
+const (
+	// authTimeout 限制用户中心故障时单次鉴权等待时间。
+	authTimeout = 5 * time.Second
+	// maxAuthResponseBytes 限制身份响应大小，防止上游异常占满服务内存。
+	maxAuthResponseBytes = 64 << 10
+)
 
-func checkAuth(token string) (*userInfo, error) {
+var httpClient = &http.Client{Timeout: authTimeout}
+
+// checkAuth 校验外部用户中心响应，只接受 HTTP 200 和正整数用户 ID。
+// 请求继承客户端取消且最多等待 5 秒；不记录令牌、响应正文或可能包含令牌的网络错误。
+// 401/403 返回无身份，其余协议或网络错误返回错误，由 Auth 拒绝请求。
+func checkAuth(ctx context.Context, token string) (*userInfo, error) {
 	conf := config.GetConfig()
-	path := "/api/v1/login/check/auth"
-	url := fmt.Sprintf("%s%s?access_token=%s", conf.DependOn.User.Address, path, token)
-	req, err := http.NewRequest("GET", url, nil)
+	endpoint, err := url.Parse(strings.TrimRight(conf.DependOn.User.Address, "/") + "/api/v1/login/check/auth")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid user service address")
+	}
+	query := endpoint.Query()
+	query.Set("access_token", token)
+	endpoint.RawQuery = query.Encode()
+	ctx, cancel := context.WithTimeout(ctx, authTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create authentication request failed")
 	}
 	res, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("user service request failed")
 	}
 	defer res.Body.Close()
-	if res.StatusCode == 401 {
+	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
 		return nil, nil
 	}
-	if res.StatusCode == 500 {
-		err = zerror.NewByMsg("服务器内部错误")
-		return nil, err
+	// 网关错误也可能是 JSON，不能仅凭可解析就把它当作登录成功。
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected user service status: %d", res.StatusCode)
 	}
-	body, err := io.ReadAll(res.Body)
+	if !strings.Contains(res.Header.Get("Content-Type"), "application/json") {
+		return nil, fmt.Errorf("unexpected user service content type")
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxAuthResponseBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read user service response failed")
 	}
-
-	log.InfoF("Response body: %s", string(body))
-
-	contentType := res.Header.Get("Content-Type")
-	if !strings.Contains(contentType, "application/json") {
-		return nil, fmt.Errorf("unexpected content type: %s", contentType)
+	if len(body) > maxAuthResponseBytes {
+		return nil, fmt.Errorf("user service response too large")
 	}
-
 	user := &userInfo{}
-	err = json.Unmarshal(body, user)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal error: %w, response: %s", err, string(body))
+	if err := json.Unmarshal(body, user); err != nil {
+		return nil, fmt.Errorf("invalid user service response")
 	}
-
-	//user := &userInfo{}
-	//err = json.Unmarshal(body, user)
-	//if err != nil {
-	//	return nil, err
-	//}
+	// ID 0 在上传控制器代表匿名公共资源，不能由异常鉴权响应隐式产生。
+	if user.ID <= 0 {
+		return nil, fmt.Errorf("invalid authenticated user identity")
+	}
 	return user, nil
 }

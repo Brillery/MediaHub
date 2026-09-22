@@ -1,7 +1,9 @@
+// 本模块提供短链进程内缓存和 Redis 缓存组合。输入为 key/value/TTL，输出为缓存值。
+// 本地 map 由互斥锁保护，跨实例事实归 Redis/MySQL 维护；本模块不负责鉴权或持久化。
+// 只有显式 Set 才知道 TTL，Redis Get 没有剩余寿命信息时不回填本地，避免延长负缓存。
 package cache
 
 import (
-	"math/rand"
 	"sync"
 	"time"
 )
@@ -72,7 +74,7 @@ func NewMemoryCache() LocalCache {
 	// 4.go设计哲学：返回接口，遵循“编程到接口而非实现”的原则
 }
 
-// Get 从本地缓存中获取值
+// Get 返回尚未过期的值；过期项由定时清理统一删除，避免异步删除覆盖并发 Set。
 func (c *MemoryCache) Get(key string) (string, bool) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
@@ -84,8 +86,7 @@ func (c *MemoryCache) Get(key string) (string, bool) {
 
 	// 检查是否过期
 	if !item.expiration.IsZero() && time.Now().After(item.expiration) {
-		// 异步删除过期项
-		go c.Delete(key)
+		// 持读锁时只报告过期，不启动延迟删除；否则可能删掉随后写入的新值。
 		return "", false
 	}
 
@@ -172,12 +173,8 @@ func (c *TwoLevelCache) Get(key string) (string, error) {
 		return "", err
 	}
 
-	// 如果分布式缓存中有值，则更新本地缓存
-	if value != "" {
-		// 使用随机过期时间，避免缓存雪崩
-		ttl := time.Duration(DefaultTTL*80/100+rand.Intn(DefaultTTL*40/100)) * time.Second
-		c.localCache.Set(key, value, ttl)
-	}
+	// KVCache.Get 不携带剩余 TTL，不能把即将失效的值重新保存 30 天。
+	// 本实例写入的热点仍走 L1；跨实例读取以 Redis 的有效期为准。
 
 	return value, nil
 }
@@ -190,10 +187,12 @@ func (c *TwoLevelCache) Set(key, value string, ttl int) error {
 		return err
 	}
 
-	// 再存储到本地缓存
-	// 使用随机过期时间，避免缓存雪崩
-	localTTL := time.Duration(ttl*80/100+rand.Intn(ttl*40/100)) * time.Second
-	c.localCache.Set(key, value, localTTL)
+	// TTL 已由业务层添加抖动；本地不能再次放大，也不能对 1 秒 TTL 调用 Intn(0)。
+	if ttl > 0 {
+		c.localCache.Set(key, value, time.Duration(ttl)*time.Second)
+	} else {
+		c.localCache.Delete(key)
+	}
 
 	return nil
 }

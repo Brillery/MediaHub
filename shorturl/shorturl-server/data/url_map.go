@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"fmt"
 	"github.com/pkg/errors"
+	"shorturl/pkg/constants"
 	"shorturl/pkg/log"
 	"shorturl/pkg/zerror"
 )
@@ -38,8 +39,8 @@ type IUrlMapData interface {
 	// GetByID 通过ID查询URL映射记录
 	GetByID(id int64) (*UrlMapEntity, error)
 
-	// GetByOriginal 通过原始URL查询映射记录
-	GetByOriginal(originalUrl string) (UrlMapEntity, error)
+	// GetByOriginal 查询原始 URL；用户表必须同时限定 userID，与创建锁和唯一索引的范围一致。
+	GetByOriginal(originalUrl string, userID int64) (UrlMapEntity, error)
 
 	// IncrementTimes 增加指定记录的访问次数
 	IncrementTimes(id int64, incrementTimes int, now int64) error
@@ -137,16 +138,22 @@ func (d *urlMapData) GetByID(id int64) (*UrlMapEntity, error) {
 	return &entity, nil
 }
 
-// GetByOriginal 通过原始URL查询映射记录
+// GetByOriginal 查询原始 URL；用户表必须同时限定 userID，与创建锁和唯一索引的范围一致。
 // 参数：
 //   - originalUrl: 原始URL
 //
 // 返回：
 //   - 查询到的实体对象（未找到时各字段为零值）
 //   - 错误信息（数据库操作失败时）
-func (d *urlMapData) GetByOriginal(originalUrl string) (UrlMapEntity, error) {
+func (d *urlMapData) GetByOriginal(originalUrl string, userID int64) (UrlMapEntity, error) {
 	sqlStr := fmt.Sprintf("select id, short_key, original_url from %s where original_url = ?", d.tableName)
-	row := d.db.QueryRow(sqlStr, originalUrl)
+	args := []any{originalUrl}
+	// 同一 URL 可以属于多个用户，只能复用当前用户的短链，不能取另一个用户的首行。
+	if d.tableName == constants.TABLENAME_URL_MAP_USER {
+		sqlStr += " and user_id = ?"
+		args = append(args, userID)
+	}
+	row := d.db.QueryRow(sqlStr, args...)
 	entity := UrlMapEntity{}
 	var shortKey sql.NullString
 	var storedOriginalURL sql.NullString

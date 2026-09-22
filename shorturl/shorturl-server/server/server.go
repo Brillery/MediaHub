@@ -1,6 +1,6 @@
 // Package server 承载 shorturl gRPC 服务的核心业务编排。
 //
-// 本模块负责在短链生成、短链解析、Redis 缓存、布隆过滤器、分布式锁和 MySQL 数据访问之间做请求级协调。
+// 本模块负责在短链生成、短链解析、Redis 缓存、分布式锁和 MySQL 数据访问之间做请求级协调。
 // 输入来自 gRPC proto 请求；输出是 proto.Url 或明确错误。
 // 状态边界：短链持久化状态归 data 层维护，缓存状态归 cache 层维护，本模块只决定何时读取、回填和降级。
 // 并发边界：缓存击穿通过分布式锁收敛，同一个短链 key 在多实例并发 miss 时只允许一个请求优先回源；锁失败时允许直接回源兜底，保证可用性优先。
@@ -20,7 +20,6 @@ import (
 	"shorturl/proto"
 	"shorturl/shorturl-server/cache"
 	"shorturl/shorturl-server/data"
-	"strconv"
 	"time"
 )
 
@@ -44,22 +43,18 @@ type shortUrlService struct {
 	urlMapDataFactory    data.IUrlMapDataFactory
 	kvCacheFactory       cache.CacheFactory
 	lockFactory          cache.DistributedLockFactory
-	bloomFactory         cache.BloomFilterFactory
 	accessCounterFactory cache.AccessCounterFactory
-	bloomFilter          cache.BloomFilter
-	userBloomFilter      cache.BloomFilter
 	cacheWarmer          cache.CacheWarmer
 }
 
-// NewService 创建一个新的短链接服务实例
-func NewService(cnf *config.Config, logger log.ILogger, urlDataFactory data.IUrlMapDataFactory, kvCacheFactory cache.CacheFactory, lockFactory cache.DistributedLockFactory, bloomFactory cache.BloomFilterFactory, accessCounterFactory cache.AccessCounterFactory) proto.ShortUrlServer {
+// NewService 创建短链服务并预热热点缓存；持久记录只以 MySQL 为准。
+// 不完整的布隆索引不再接入生产请求，避免多实例覆盖和冷数据缺失导致合法短链不可用。
+func NewService(cnf *config.Config, logger log.ILogger, urlDataFactory data.IUrlMapDataFactory, kvCacheFactory cache.CacheFactory, lockFactory cache.DistributedLockFactory, accessCounterFactory cache.AccessCounterFactory) proto.ShortUrlServer {
 	// 创建缓存预热器
 	kvCache := kvCacheFactory.NewKVCache()
-	bloomFilter := bloomFactory.NewBloomFilter("shorturl:bloom", 100000, 0.01)
-	userBloomFilter := bloomFactory.NewBloomFilter("shorturl:user:bloom", 100000, 0.01)
 
 	// 创建缓存预热器
-	cacheWarmer := cache.NewShortUrlCacheWarmer(logger, kvCache, urlDataFactory, bloomFilter)
+	cacheWarmer := cache.NewShortUrlCacheWarmer(logger, kvCache, urlDataFactory, nil)
 
 	// 创建服务实例
 	service := &shortUrlService{
@@ -68,10 +63,7 @@ func NewService(cnf *config.Config, logger log.ILogger, urlDataFactory data.IUrl
 		urlMapDataFactory:    urlDataFactory,
 		kvCacheFactory:       kvCacheFactory,
 		lockFactory:          lockFactory,
-		bloomFactory:         bloomFactory,
 		accessCounterFactory: accessCounterFactory,
-		bloomFilter:          bloomFilter,
-		userBloomFilter:      userBloomFilter,
 		cacheWarmer:          cacheWarmer,
 	}
 
@@ -151,16 +143,6 @@ func (s *shortUrlService) GetShortUrl(ctx context.Context, in *proto.Url) (*prot
 		return nil, err
 	}
 
-	// 将短链接ID添加到布隆过滤器
-	if s.bloomFilter != nil {
-		if !isPublic {
-
-			s.userBloomFilter.Add("", strconv.FormatInt(entity.ID, 10))
-		} else {
-			s.bloomFilter.Add("", strconv.FormatInt(entity.ID, 10))
-		}
-	}
-
 	return &proto.Url{
 		Url:    domain + entity.ShortKey,
 		UserID: in.UserID,
@@ -172,7 +154,7 @@ func (s *shortUrlService) GetShortUrl(ctx context.Context, in *proto.Url) (*prot
 // 并发边界：首次查询未命中后，必须按原始 URL 获取分布式锁并在锁内二次查询。
 // 这样多实例同时为同一个 URL 生成短链时，只有第一个请求会真正写入，其余请求会复用锁内已出现的记录。
 func (s *shortUrlService) getOrCreateURLMapping(in *proto.Url, isPublic bool, d data.IUrlMapData) (data.UrlMapEntity, error) {
-	entity, err := d.GetByOriginal(in.Url)
+	entity, err := d.GetByOriginal(in.Url, in.GetUserID())
 	if err != nil {
 		return entity, err
 	}
@@ -202,7 +184,7 @@ func (s *shortUrlService) createURLMappingWithOriginalLock(in *proto.Url, isPubl
 		defer lock.Unlock(lockKey)
 
 		// 获锁后必须二次查询：等待锁期间可能已有其他实例完成创建。
-		entity, err := d.GetByOriginal(in.Url)
+		entity, err := d.GetByOriginal(in.Url, in.GetUserID())
 		if err != nil {
 			return entity, err
 		}
@@ -214,7 +196,7 @@ func (s *shortUrlService) createURLMappingWithOriginalLock(in *proto.Url, isPubl
 
 	// 未抢到锁时短暂等待持锁实例写入；仍未出现映射则直接创建，避免请求长期阻塞。
 	time.Sleep(100 * time.Millisecond)
-	entity, err := d.GetByOriginal(in.Url)
+	entity, err := d.GetByOriginal(in.Url, in.GetUserID())
 	if err != nil {
 		return entity, err
 	}
@@ -322,38 +304,8 @@ func (s *shortUrlService) GetOriginalUrl(ctx context.Context, in *proto.ShortKey
 
 	// 如果缓存未命中，从数据库获取原始URL
 	if originalUrl == "" {
-		// 使用布隆过滤器检查短链接ID是否存在
-		if s.bloomFilter != nil {
-			if !isPublic {
-
-				exists, err := s.userBloomFilter.Exists("", strconv.FormatInt(id, 10))
-				if err != nil {
-					s.log.Warning("布隆过滤器检查失败: " + err.Error())
-				} else if !exists {
-					// 布隆过滤器判断短链接不存在，直接返回错误
-					err := zerror.NewByMsg("短链不存在")
-					s.log.Error(err)
-					return nil, err
-				}
-			} else {
-				exists, err := s.bloomFilter.Exists("", strconv.FormatInt(id, 10))
-				if err != nil {
-					s.log.Warning("布隆过滤器检查失败: " + err.Error())
-				} else if !exists {
-					// 布隆过滤器判断短链接不存在，直接返回错误
-					err := zerror.NewByMsg("短链不存在")
-					s.log.Error(err)
-					return nil, err
-				}
-			}
-		}
-
-		// 缓存穿透过滤
-		err = s.idFilter(id, kvCache, isPublic)
-		if err != nil {
-			s.log.Error(err)
-			return nil, err
-		}
+		// 热点预热只覆盖部分记录，布隆过滤器缺项和每日 max_id 都不能证明记录不存在。
+		// Redis 丢失或新增短链超过旧 max_id 时仍需按主键回源；真实未命中由 60 秒负缓存保护。
 
 		originalUrl, err = s.resolveOriginalURLOnCacheMiss(id, key, kvCache, d)
 		if err != nil {
@@ -461,53 +413,6 @@ func (s *shortUrlService) loadOriginalURLFromDB(id int64, key string, kvCache ca
 		return "", zerror.NewByErr(err)
 	}
 	return originalURL, nil
-}
-
-// idFilter 验证短链ID是否合法
-// 参数:
-//
-//	id: 需要验证的短链ID
-//	kvCache: 用于存储和获取最大ID的键值缓存实例
-//	isPublic: 是否为公共短链标识，true表示使用公共表，false使用用户表
-//
-// 返回值:
-//
-//	error: 验证失败时返回错误，nil表示验证通过
-func (s *shortUrlService) idFilter(id int64, kvCache cache.KVCache, isPublic bool) error {
-	key := fmt.Sprintf("%s_%s", constants.TABLENAME_URL_MAP, "max_id")
-	// 根据是否为公共短链选择不同的最大ID缓存键
-	if !isPublic {
-		key = fmt.Sprintf("%s_%s", constants.TABLENAME_URL_MAP_USER, "max_id")
-	}
-
-	idStr, err := kvCache.Get(key)
-
-	if err != nil {
-		s.log.Error(err)
-		return err
-	}
-
-	var rs int64
-	// 从缓存中解析当前最大ID值
-	if idStr != "" {
-		rs, err = strconv.ParseInt(idStr, 10, 64)
-		if err != nil {
-			s.log.Error(err)
-			return err
-		}
-	} else {
-		// max_id 由独立 crontab 写入，服务刚启动、Redis 过期或定时任务延迟时可能暂时缺失。
-		// 这里不能直接判定短链非法，必须放行到 DB 回源，否则会把合法短链误判成 404。
-		return nil
-	}
-
-	// 验证传入ID是否小于等于当前最大合法ID
-	if rs < id {
-		err = zerror.NewByMsg("短链非法")
-		s.log.Error(err)
-		return err
-	}
-	return nil
 }
 
 // randomShortURLCacheTTL 返回带随机抖动的正常短链缓存 TTL。

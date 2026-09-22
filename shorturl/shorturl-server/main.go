@@ -56,9 +56,6 @@ func main() {
 	// 创建分布式锁工厂
 	lockFactory := cache.NewRedisDistributedLockFactory(redisPool)
 
-	// 创建布隆过滤器工厂
-	bloomFactory := cache.NewRedisBloomFilterFactory(redisPool)
-
 	// 创建短链访问计数器工厂，解析请求只写 Redis 增量，定时任务再批量落库。
 	accessCounterFactory := cache.NewRedisAccessCounterFactory(redisPool)
 
@@ -76,7 +73,7 @@ func main() {
 
 	// 创建gRPC服务器实例并注册ShortUrl服务
 	s := grpc.NewServer(grpc.UnaryInterceptor(interceptor.UnaryAuthInterceptor), grpc.StreamInterceptor(interceptor.StreamAuthInterceptor))
-	service := server.NewService(cnf, logger, urlMapDataFactory, kvCacheFactory, lockFactory, bloomFactory, accessCounterFactory)
+	service := server.NewService(cnf, logger, urlMapDataFactory, kvCacheFactory, lockFactory, accessCounterFactory)
 	proto.RegisterShortUrlServer(s, service)
 
 	// 多路复用健康检查
