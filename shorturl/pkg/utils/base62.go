@@ -4,7 +4,10 @@
 // 或非法字符，统一返回 0，交由上层按“非法短链”处理，避免负数 ID 继续进入缓存和数据库查询。
 package utils
 
-import "strings"
+import (
+	"math"
+	"strings"
+)
 
 // chars 定义了用于Base62编码的字符集
 const chars = "cLM01lmno26789abNOPQRSdefghij45stuUVWXvwxyzABCDEFGHIJKTYZkpqr3"
@@ -35,10 +38,18 @@ func ToBase62(num int64) string {
 //
 //	Base62编码解码后的整数
 func ToBase10(str string) int64 {
+	// ID 使用 int64；拒绝前导零别名，避免同一 ID 拥有无限多个缓存 key。
+	if str == "" || str[0] == chars[0] {
+		return 0
+	}
 	var rs int64 = 0
 	for _, s := range str {
 		index := strings.IndexRune(chars, s)
 		if index < 0 {
+			return 0
+		}
+		// 先检查乘加上界，防止溢出后映射到另一个有效 ID。
+		if rs > (math.MaxInt64-int64(index))/62 {
 			return 0
 		}
 		rs = rs*62 + int64(index)

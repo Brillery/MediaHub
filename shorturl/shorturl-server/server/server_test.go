@@ -35,15 +35,6 @@ func TestGetOriginalUrlReturnsNotFoundFromNegativeCache(t *testing.T) {
 	}
 }
 
-func TestIDFilterAllowsDBFallbackWhenMaxIDCacheMissing(t *testing.T) {
-	kvCache := newFakeKVCache(nil)
-	service := newTestShortURLService(kvCache, &fakeURLMapData{})
-
-	if err := service.idFilter(123, kvCache, true); err != nil {
-		t.Fatalf("idFilter error = %v, want nil when max_id cache is missing", err)
-	}
-}
-
 func TestGetOriginalUrlWritesNegativeCacheOnDBMiss(t *testing.T) {
 	key := utils.ToBase62(123)
 	kvCache := newFakeKVCache(nil)
@@ -275,6 +266,7 @@ type fakeURLMapData struct {
 	updatedEntity      mapdata.UrlMapEntity
 	getByIDCalls       int
 	getByOriginalCalls int
+	queriedUserIDs     []int64
 	generateCalls      int
 	updateCalls        int
 	incrementCalls     int
@@ -299,8 +291,9 @@ func (d *fakeURLMapData) GetByID(_ int64) (*mapdata.UrlMapEntity, error) {
 	return d.entity, nil
 }
 
-func (d *fakeURLMapData) GetByOriginal(_ string) (mapdata.UrlMapEntity, error) {
+func (d *fakeURLMapData) GetByOriginal(_ string, userID int64) (mapdata.UrlMapEntity, error) {
 	d.getByOriginalCalls++
+	d.queriedUserIDs = append(d.queriedUserIDs, userID)
 	if len(d.originalResults) > 0 {
 		entity := d.originalResults[0]
 		d.originalResults = d.originalResults[1:]
@@ -341,3 +334,45 @@ func (c *fakeAccessCounter) Increment(tableName string, id int64) error {
 }
 
 func (c *fakeAccessCounter) Destroy() {}
+
+func TestGetOriginalUrlFallsBackForIncompleteIndexes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		public bool
+		max    string
+	}{
+		{"public cold cache", true, ""}, {"user cold cache", false, ""},
+		{"stale maximum", true, "1"}, {"corrupt maximum", false, "invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kv := newFakeKVCache(map[string]string{"url_map_max_id": tc.max, "url_map_user_max_id": tc.max})
+			d := &fakeURLMapData{entity: &mapdata.UrlMapEntity{OriginalUrl: "https://img.example.com/exists.jpg"}}
+			s := newTestShortURLService(kv, d)
+			// 生产构造已不接入不完整布隆索引；冷缓存必须正常回源。
+			out, err := s.GetOriginalUrl(context.Background(), &proto.ShortKey{Key: utils.ToBase62(123), IsPublic: tc.public})
+			if err != nil {
+				t.Fatalf("existing mapping rejected: %v", err)
+			}
+			if out.Url != d.entity.OriginalUrl || d.getByIDCalls != 1 {
+				t.Fatalf("mapping not loaded: %#v", out)
+			}
+		})
+	}
+}
+
+func TestGetShortUrlScopesEveryLookupToUser(t *testing.T) {
+	d := &fakeURLMapData{generatedID: 321}
+	s := newTestShortURLService(newFakeKVCache(nil), d)
+	_, err := s.GetShortUrl(context.Background(), &proto.Url{Url: "https://img.example.com/shared.jpg", UserID: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.queriedUserIDs) != 2 {
+		t.Fatalf("lookups = %v", d.queriedUserIDs)
+	}
+	for _, id := range d.queriedUserIDs {
+		if id != 42 {
+			t.Fatalf("unscoped lookup: %d", id)
+		}
+	}
+}

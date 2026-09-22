@@ -22,3 +22,11 @@ func TestToBase10RejectsInvalidCharacters(t *testing.T) {
 		t.Fatalf("ToBase10 invalid key = %d, want 0", got)
 	}
 }
+
+func TestToBase10RejectsOverflowAndAliases(t *testing.T) {
+	for _, key := range []string{ToBase62(math.MaxInt64) + "L", "c" + ToBase62(1)} {
+		if got := ToBase10(key); got != 0 {
+			t.Errorf("invalid key %q decoded to %d", key, got)
+		}
+	}
+}

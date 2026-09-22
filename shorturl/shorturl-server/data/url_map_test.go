@@ -47,7 +47,7 @@ func TestGetByOriginalReturnsOriginalURLForCacheBackfill(t *testing.T) {
 			AddRow(int64(88), "1q", originalURL))
 
 	data := newUrlMapData(log.NewLogger(), db, "url_map")
-	entity, err := data.GetByOriginal(originalURL)
+	entity, err := data.GetByOriginal(originalURL, 0)
 	if err != nil {
 		t.Fatalf("GetByOriginal error = %v, want nil", err)
 	}
@@ -56,5 +56,22 @@ func TestGetByOriginalReturnsOriginalURLForCacheBackfill(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+func TestGetByOriginalScopesUserTable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	original := "https://img.example.com/shared.jpg"
+	mock.ExpectQuery("select id, short_key, original_url from url_map_user where original_url = \\? and user_id = \\?").WithArgs(original, int64(42)).WillReturnRows(sqlmock.NewRows([]string{"id", "short_key", "original_url"}).AddRow(88, "1q", original))
+	d := newUrlMapData(log.NewLogger(), db, "url_map_user")
+	if _, err := d.GetByOriginal(original, 42); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
